@@ -1,0 +1,9 @@
+.git
+.venv
+node_modules
+dist
+backend/__pycache__
+backend/screenshots/*.png
+backend/data
+pricebot/**/__pycache__
+*.log

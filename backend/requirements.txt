@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+openpyxl
+python-multipart
+pillow
+beautifulsoup4>=4.12
+curl_cffi>=0.7
+playwright>=1.40
+playwright-stealth>=1.0.6
