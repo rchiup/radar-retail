@@ -25,6 +25,11 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from pricebot import fetch_price, fetch_prices, known_retailers
+from backend.cloud_scraper import (
+    CloudConfigError,
+    assert_retail_cloud_allowed,
+    webhook_requirement_note,
+)
 
 
 logger = logging.getLogger("radar-retail")
@@ -66,6 +71,10 @@ app.add_middleware(
 app.mount("/screenshots", StaticFiles(directory=SCREENSHOTS_DIR), name="screenshots")
 
 
+# In-memory cancel flags for the current process. Survives only while the API is up.
+_CANCEL_REQUESTED: set[str] = set()
+
+
 class CampaignCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     client: str = Field(default="", max_length=120)
@@ -78,6 +87,7 @@ class CampaignRunRequest(BaseModel):
     screenshot: bool = True
     only_failed: bool = False
     google_fallback: bool = True
+    capture_mode: Literal["local", "cloud"] = "local"
 
 
 class PriceRequest(BaseModel):
@@ -180,6 +190,17 @@ def init_db() -> None:
         for column, definition in (("fallback_screenshot_url", "TEXT"), ("evidence_source", "TEXT NOT NULL DEFAULT 'retailer'"), ("evidence_confidence", "TEXT NOT NULL DEFAULT 'official'")):
             try:
                 connection.execute(f"ALTER TABLE products ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
+        for column, definition in (
+            ("run_started_at", "TEXT"),
+            ("run_ended_at", "TEXT"),
+            ("capture_mode", "TEXT NOT NULL DEFAULT 'local'"),
+            ("cloud_job_id", "TEXT"),
+            ("cloud_status", "TEXT"),
+        ):
+            try:
+                connection.execute(f"ALTER TABLE campaigns ADD COLUMN {column} {definition}")
             except sqlite3.OperationalError:
                 pass
         connection.execute(
@@ -358,7 +379,10 @@ def validate_retail_url(retailer: str, url: str | None) -> None:
         if "no permitida" in str(exc):
             raise
     allowed_domains = {
+        "abc_cl": ("abc.cl",),
+        "claro_cl": ("clarochile.cl", "tienda.clarochile.cl"),
         "falabella_cl": ("falabella.com",),
+        "hites_cl": ("hites.com",),
         "sodimac_cl": ("sodimac.cl",),
         "paris_cl": ("paris.cl",),
         "ripley_cl": ("ripley.cl",),
@@ -412,15 +436,30 @@ def campaign_payload(campaign_id: str) -> dict:
         "non_compliant": sum(product["status"] == "non_compliant" for product in products),
         "no_price": sum(product["status"] == "no_price" for product in products),
         "error": sum(product["status"] == "error" for product in products),
+        "blocked": sum(product["status"] == "blocked" for product in products),
+        "needs_review": sum(product["status"] == "needs_review" for product in products),
     }
-    counts["processed"] = counts["compliant"] + counts["non_compliant"] + counts["no_price"] + counts["error"]
-    # A screenshot of a search page, CAPTCHA or error page is diagnostic only;
-    # count it as audit evidence only when a price was actually extracted.
-    counts["evidence"] = sum(
-        bool(product["screenshot_url"] or product.get("fallback_screenshot_url"))
+    counts["processed"] = (
+        counts["compliant"] + counts["non_compliant"] + counts["no_price"]
+        + counts["error"] + counts["blocked"] + counts["needs_review"]
+        + sum(product["status"] == "captured_unverified" for product in products)
+    )
+    counts["evidence_official"] = sum(
+        bool(product.get("screenshot_url"))
+        and product.get("evidence_source", "retailer") == "retailer"
         and product.get("detected_price") is not None
         for product in products
     )
+    counts["evidence_google"] = sum(bool(product.get("fallback_screenshot_url")) for product in products)
+    # Visual artifacts available in UI/ZIP (official and/or Google), without implying compliance.
+    counts["evidence"] = sum(
+        bool(product.get("screenshot_url") or product.get("fallback_screenshot_url"))
+        for product in products
+    )
+    by_retailer: dict[str, int] = {}
+    for product in products:
+        by_retailer[product["retailer"]] = by_retailer.get(product["retailer"], 0) + 1
+    counts["by_retailer"] = by_retailer
     return {**dict(campaign), "summary": counts, "products": products}
 
 
@@ -453,7 +492,12 @@ def annotate_screenshot(path: Path, request: PriceRequest, result: dict, capture
     campaign_range = ""
     if request.campaign_start or request.campaign_end:
         campaign_range = f" | Vigencia: {request.campaign_start or '-'} a {request.campaign_end or '-'}"
-    title = f"Evidencia Radar Retail | {request.campaign or 'Campaña sin nombre'} | {request.retail}"
+    source = str(result.get("evidence_source") or "retailer")
+    public_seal = (os.getenv("RADAR_EVIDENCE_DISCLAIMER", "internal").strip().lower() == "public")
+    if source == "google_reference" and public_seal:
+        title = f"Referencia publica | {request.campaign or 'Campaña sin nombre'} | {request.retail}"
+    else:
+        title = f"Evidencia Radar Retail | {request.campaign or 'Campaña sin nombre'} | {request.retail}"
     detail = (
         f"Captura: {timestamp} | SKU: {request.sku or '-'} | Precio observado: {price_text}"
         f" | IP: {result.get('ip_used') or '-'}"
@@ -466,24 +510,108 @@ def annotate_screenshot(path: Path, request: PriceRequest, result: dict, capture
     annotated.save(path, format="PNG", optimize=True)
 
 
+def render_indirect_evidence_card(
+    path: Path,
+    *,
+    retailer: str,
+    sku: str,
+    product_url: str | None,
+    google_price: float | int | None,
+    search_url: str,
+    captured_at: datetime,
+    note: str,
+) -> None:
+    """Clean internal MVP evidence card.
+
+    Visual disclaimer is optional via RADAR_EVIDENCE_DISCLAIMER=public.
+    Metadata (evidence_source/confidence) always stays honest in the database.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    show_public_seal = (os.getenv("RADAR_EVIDENCE_DISCLAIMER", "internal").strip().lower() == "public")
+
+    width, height = 1440, 900
+    image = Image.new("RGB", (width, height), "#F4F6F2")
+    draw = ImageDraw.Draw(image)
+    title_font = screenshot_font(30)
+    body_font = screenshot_font(22)
+    small_font = screenshot_font(18)
+    price_font = screenshot_font(64)
+    brand_font = screenshot_font(20)
+
+    # Soft SaaS header (not a retailer clone).
+    draw.rectangle((0, 0, width, 96), fill="#13241B")
+    draw.text((40, 30), "Radar Retail", fill="#C8F16D", font=brand_font)
+    draw.text((200, 28), "Evidencia de monitoreo", fill="#F4F7F2", font=title_font)
+
+    if show_public_seal:
+        draw.rectangle((0, 96, width, 148), fill="#3D2A12")
+        draw.text((40, 110), "Referencia publica · confianza baja · no sustituye captura oficial", fill="#F8E3B0", font=small_font)
+        content_top = 180
+    else:
+        content_top = 130
+
+    # Card body
+    draw.rounded_rectangle((36, content_top, width - 36, height - 36), radius=24, fill="#FFFFFF")
+    draw.rectangle((36, content_top, 48, height - 36), fill="#C8F16D")
+
+    retailer_label = retailer.replace("_", " ").title()
+    price_text = (
+        f"${int(google_price):,}".replace(",", ".")
+        if isinstance(google_price, (int, float))
+        else "Sin precio"
+    )
+
+    y = content_top + 36
+    draw.text((72, y), retailer_label, fill="#14231B", font=title_font)
+    y += 48
+    draw.text((72, y), f"SKU {sku or '-'}", fill="#435149", font=body_font)
+    y += 56
+    draw.text((72, y), price_text, fill="#1F6F4A", font=price_font)
+    y += 90
+    meta = [
+        f"Fecha: {captured_at.strftime('%Y-%m-%d %H:%M:%S')} Chile",
+        f"URL: {(product_url or '-')[:108]}",
+        f"Fuente de precio: referencia publica",
+        note[:140] if note else "",
+    ]
+    for line in meta:
+        if not line:
+            continue
+        draw.text((72, y), line, fill="#718078", font=small_font)
+        y += 36
+
+    # Subtle footer for MVP internal use (no alarmist banner).
+    footer = "Radar Retail · evidencia de campana"
+    draw.text((72, height - 78), footer, fill="#9AA59C", font=small_font)
+    image.save(path, format="PNG", optimize=True)
+
+
+
 def google_reference_fallback(retailer: str, sku: str, url: str | None, screenshot_path: Path | None) -> dict:
-    """Create secondary Google evidence when the official page has no price."""
+    """Evidencia secundaria desde Google + ficha recreada para uso interno de marca."""
     query = f"{retailer.replace('_', ' ')} {sku}" if sku else f"{retailer.replace('_', ' ')} {url or ''}"
     search_url = "https://www.google.com/search?q=" + quote_plus(query)
-    result = {"new_price": None, "original_price": None, "used_link": search_url,
-              "evidence_source": "google_reference", "evidence_confidence": "low",
-              "ip_used": None, "error": "Referencia Google (evidencia secundaria)"}
+    captured_at = datetime.now().astimezone()
+    result = {
+        "new_price": None,
+        "original_price": None,
+        "used_link": search_url,
+        "evidence_source": "google_reference",
+        "evidence_confidence": "low",
+        "ip_used": None,
+        "error": "Recreacion interna desde Google (no oficial del retail)",
+    }
+    serp_path = None
     try:
         from playwright.sync_api import sync_playwright
+
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_page(locale="es-CL", viewport={"width": 1440, "height": 1100})
             response = page.goto(search_url, wait_until="domcontentloaded", timeout=20_000)
-            text = page.locator("body").inner_text(timeout=5_000)
+            body_text = page.locator("body").inner_text(timeout=5_000)
             prices = []
-            # Require Chilean currency formatting so years, IDs and result counts
-            # (for example 2026) are never interpreted as prices.
-            for match in re.finditer(r"\$\s*(\d{1,3}(?:[.]\d{3})+)", text):
+            for match in re.finditer(r"\$\s*(\d{1,3}(?:[.]\d{3})+)", body_text):
                 value = int(match.group(1).replace(".", ""))
                 if 500 <= value <= 50_000_000:
                     prices.append(value)
@@ -491,14 +619,36 @@ def google_reference_fallback(retailer: str, sku: str, url: str | None, screensh
                 result["new_price"] = prices[0]
             if screenshot_path:
                 screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(screenshot_path), full_page=True)
-                result["screenshot_path"] = str(screenshot_path)
+                serp_path = screenshot_path.with_name(screenshot_path.stem + "-serp.png")
+                page.screenshot(path=str(serp_path), full_page=True)
             result["http_status"] = response.status if response else None
             browser.close()
     except Exception as exc:
         result["error"] = f"Google fallback unavailable: {str(exc)[:180]}"
         logger.warning("event=google_fallback_failed retailer=%s sku=%s error=%s", retailer, sku, str(exc)[:180])
-    logger.info("event=google_fallback retailer=%s sku=%s price=%s screenshot=%s", retailer, sku, result.get("new_price"), bool(result.get("screenshot_path")))
+
+    if screenshot_path:
+        render_indirect_evidence_card(
+            screenshot_path,
+            retailer=retailer,
+            sku=sku,
+            product_url=url,
+            google_price=result.get("new_price"),
+            search_url=search_url,
+            captured_at=captured_at,
+            note="Generada porque la ficha oficial no entrego precio (bloqueo, layout o sin dato).",
+        )
+        result["screenshot_path"] = str(screenshot_path)
+        if serp_path and Path(serp_path).exists():
+            result["serp_screenshot_path"] = str(serp_path)
+
+    logger.info(
+        "event=fallback_used retailer=%s sku=%s price=%s screenshot=%s",
+        retailer,
+        sku,
+        result.get("new_price"),
+        bool(result.get("screenshot_path")),
+    )
     return result
 
 
@@ -554,11 +704,19 @@ def store_capture(
         fallback = google_reference_fallback(product["retailer"], product["sku"], product["url"], fallback_path)
         if fallback.get("screenshot_path"):
             annotate_screenshot(fallback_path, request, fallback, captured_at)
-            outcome = {**outcome, "google_reference_price": fallback.get("new_price"),
-                       "fallback_screenshot_url": f"/screenshots/{fallback_path.name}",
-                       "evidence_source": "google_reference", "evidence_confidence": "low"}
-            if fallback.get("new_price") is not None:
-                outcome["new_price"] = fallback["new_price"]
+            # Keep Google as secondary reference only. Never copy its price into the
+            # official observed price used for compliance decisions.
+            outcome = {
+                **outcome,
+                "google_reference_price": fallback.get("new_price"),
+                "fallback_screenshot_url": f"/screenshots/{fallback_path.name}",
+                "evidence_source": "google_reference",
+                "evidence_confidence": "low",
+            }
+            logger.info(
+                "event=fallback_used campaign=%s retailer=%s sku=%s google_price=%s",
+                campaign["id"], product["retailer"], product["sku"], fallback.get("new_price"),
+            )
     detected = outcome.get("new_price")
     detected_number = float(detected) if isinstance(detected, (int, float)) else None
     if detected_number is not None and detected_number < 500:
@@ -567,12 +725,33 @@ def store_capture(
         outcome["new_price"] = None
         outcome["error"] = (outcome.get("error") or "") + " | Precio descartado por valor inválido"
     target = float(product["promo_price"] or 0)
+    error_text = str(outcome.get("error") or "").lower()
+    http_status = outcome.get("http_status")
+    blocked_signals = (
+        "anti-bot", "captcha", "cloudflare", "blocked", "http 403", "http 429",
+        "403", "429", "robot or human",
+    )
+    is_blocked = (
+        http_status in {403, 429}
+        or any(signal in error_text for signal in blocked_signals)
+        or "challenge" in error_text
+    )
     if outcome.get("status") == "PRODUCT_NOT_FOUND":
         status = "no_price"
+    elif is_blocked and detected_number is None:
+        status = "blocked"
+        outcome["error"] = (outcome.get("error") or "Acceso bloqueado por el retail") + " | Requiere revisión manual"
+        logger.warning(
+            "event=page_blocked campaign=%s retailer=%s sku=%s http_status=%s error=%s",
+            campaign["id"], product["retailer"], product["sku"], http_status, str(outcome.get("error"))[:180],
+        )
+    elif detected_number is None and outcome.get("evidence_source") == "google_reference":
+        status = "needs_review"
     elif detected_number is None:
         status = "no_price"
     elif outcome.get("evidence_source") == "google_reference":
-        status = "captured_unverified"
+        # Should not happen for official price, but keep defensive.
+        status = "needs_review"
     elif not target:
         status = "captured_unverified"
     elif detected_number <= target:
@@ -581,8 +760,7 @@ def store_capture(
         status = "non_compliant"
     screenshot_url = f"/screenshots/{screenshot_path.name}" if screenshot_path and screenshot_path.exists() else None
     fallback_url = outcome.get("fallback_screenshot_url") if isinstance(outcome, dict) else None
-    if not screenshot_url and fallback_url:
-        screenshot_url = fallback_url
+    # Never promote Google reference screenshots to the official evidence slot.
     with db() as connection:
         connection.execute(
             """
@@ -708,27 +886,69 @@ def run_campaign_job(campaign_id: str, options: CampaignRunRequest) -> None:
         groups: dict[str, list[sqlite3.Row]] = {}
         for product in products:
             groups.setdefault(product["retailer"], []).append(product)
+        cancelled = False
         for retail_products in groups.values():
+            if campaign_id in _CANCEL_REQUESTED:
+                cancelled = True
+                break
             chunk_size = 6 if options.method == "playwright" else 25
             for start in range(0, len(retail_products), chunk_size):
+                if campaign_id in _CANCEL_REQUESTED:
+                    cancelled = True
+                    break
                 capture_batch(retail_products[start : start + chunk_size], campaign, options)
+            if cancelled:
+                break
         with db() as connection:
             errors = connection.execute(
-                "SELECT COUNT(*) FROM products WHERE campaign_id = ? AND status IN ('error', 'no_price')",
+                "SELECT COUNT(*) FROM products WHERE campaign_id = ? AND status IN ('error', 'no_price', 'blocked', 'needs_review')",
                 (campaign_id,),
             ).fetchone()[0]
+            pending_left = connection.execute(
+                "SELECT COUNT(*) FROM products WHERE campaign_id = ? AND status IN ('pending', 'running')",
+                (campaign_id,),
+            ).fetchone()[0]
+            if cancelled:
+                connection.execute(
+                    "UPDATE products SET status = 'needs_review', error = COALESCE(error, '') || ' | Campaña cancelada', updated_at = ? WHERE campaign_id = ? AND status IN ('pending', 'running')",
+                    (now_iso(), campaign_id),
+                )
             finished = now_iso()
-            connection.execute(
-                "UPDATE campaigns SET status = ?, updated_at = ?, last_run_at = ?, last_error = NULL WHERE id = ?",
-                ("completed_with_errors" if errors else "completed", finished, finished, campaign_id),
+            final_status = (
+                "completed_with_errors" if (errors or cancelled or pending_left) else "completed"
             )
-        logger.info("event=campaign_end campaign=%s status=%s errors=%s duration_ms=%s", campaign_id, "completed_with_errors" if errors else "completed", errors, round((time.perf_counter() - job_started) * 1000))
+            connection.execute(
+                """
+                UPDATE campaigns
+                SET status = ?, updated_at = ?, last_run_at = ?, run_ended_at = ?,
+                    last_error = ?
+                WHERE id = ?
+                """,
+                (
+                    final_status,
+                    finished,
+                    finished,
+                    finished,
+                    ("Cancelada por el usuario." if cancelled else None),
+                    campaign_id,
+                ),
+            )
+        _CANCEL_REQUESTED.discard(campaign_id)
+        logger.info(
+            "event=campaign_end campaign=%s status=%s errors=%s cancelled=%s duration_ms=%s",
+            campaign_id,
+            final_status,
+            errors,
+            cancelled,
+            round((time.perf_counter() - job_started) * 1000),
+        )
     except Exception as exc:
         logger.exception("event=campaign_exception campaign=%s error=%s", campaign_id, str(exc)[:300])
+        _CANCEL_REQUESTED.discard(campaign_id)
         with db() as connection:
             connection.execute(
-                "UPDATE campaigns SET status = 'ready', updated_at = ?, last_error = ? WHERE id = ?",
-                (now_iso(), str(exc)[:700], campaign_id),
+                "UPDATE campaigns SET status = 'ready', updated_at = ?, run_ended_at = ?, last_error = ? WHERE id = ?",
+                (now_iso(), now_iso(), str(exc)[:700], campaign_id),
             )
 
 
@@ -738,13 +958,15 @@ def report_csv(campaign: dict) -> bytes:
     writer.writerow(
         [
             "Campaña", "Cliente", "Inicio", "Término", "SKU", "Descripción", "Retail", "URL", "PVP",
-            "PVP Descuento", "Precio observado", "Diferencia", "Cumplimiento", "Fecha captura", "IP", "Evidencia", "Error",
+            "PVP Descuento", "Precio observado", "Diferencia", "Cumplimiento", "Fecha captura", "IP",
+            "Evidencia oficial", "Evidencia Google", "Fuente evidencia", "Confianza", "Error",
         ]
     )
     labels = {
         "pending": "Pendiente", "running": "Capturando", "compliant": "Cumple",
         "non_compliant": "No cumple", "captured_unverified": "Sin precio objetivo",
         "no_price": "Sin precio", "error": "Error",
+        "blocked": "Bloqueado", "needs_review": "Requiere revisión",
     }
     for product in campaign["products"]:
         writer.writerow(
@@ -755,19 +977,24 @@ def report_csv(campaign: dict) -> bytes:
                 product["detected_price"] if product["detected_price"] is not None else "",
                 product["difference"] if product["difference"] is not None else "",
                 labels.get(product["status"], product["status"]), product["captured_at"] or "", product["ip_used"] or "",
-                product["screenshot_url"] or "", safe_csv(product["error"] or ""),
+                product["screenshot_url"] or "", product.get("fallback_screenshot_url") or "",
+                product.get("evidence_source") or "retailer", product.get("evidence_confidence") or "",
+                safe_csv(product["error"] or ""),
             ]
         )
     return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
 @app.get("/api/health")
-def health() -> dict[str, bool | str]:
+def health():
     return {
         "status": "ok",
         "engine": "pricebot",
         "browser_available": importlib.util.find_spec("playwright") is not None,
         "database": "ok",
+        "api_port_expected": 8001,
+        "capture_modes": "local",
+        "cloud_note": webhook_requirement_note(),
     }
 
 
@@ -851,8 +1078,50 @@ async def import_products(
             (file.filename or "campana", timestamp, campaign_id),
         )
     payload = campaign_payload(campaign_id)
+    retailers_found = sorted({str(product["retailer"]) for product in products})
+    empty_sku = sum(1 for product in products if not str(product.get("sku") or "").strip())
+    empty_url = sum(1 for product in products if not str(product.get("url") or "").strip())
+    invalid_links = []
+    for product in products:
+        url = str(product.get("url") or "").strip()
+        if not url:
+            continue
+        try:
+            validate_retail_url(str(product["retailer"]), url)
+        except ValueError as exc:
+            invalid_links.append({
+                "sku": product.get("sku"),
+                "retailer": product.get("retailer"),
+                "url": url,
+                "reason": str(exc),
+            })
+    filename = file.filename or "campana"
+    # Detect marketing names like "8-retails" that do not match the actual file content.
+    digits = re.findall(r"(\d+)\s*[-_]?\s*retail", filename.lower())
+    claimed_retails = int(digits[0]) if digits else None
+    filename_mismatch = (
+        claimed_retails is not None and claimed_retails != len(retailers_found)
+    )
     payload["import"] = {
-        "filename": file.filename or "campana", "count": len(products), "unsupported_retailers": unsupported,
+        "filename": filename,
+        "count": len(products),
+        "unsupported_retailers": unsupported,
+        "retailers_found": retailers_found,
+        "retailers_count": len(retailers_found),
+        "by_retailer": payload["summary"].get("by_retailer", {}),
+        "empty_sku": empty_sku,
+        "empty_url": empty_url,
+        "invalid_links": invalid_links[:50],
+        "invalid_links_count": len(invalid_links),
+        "claimed_retails_in_filename": claimed_retails,
+        "filename_retail_mismatch": filename_mismatch,
+        "summary_message": (
+            f"{len(products)} productos · {len(retailers_found)} retails detectados"
+            + (
+                f" (el nombre del archivo sugiere {claimed_retails})"
+                if filename_mismatch else ""
+            )
+        ),
     }
     return payload
 
@@ -864,32 +1133,75 @@ def run_campaign(campaign_id: str, request: CampaignRunRequest, background_tasks
         raise HTTPException(status_code=409, detail="La campaña ya se está ejecutando.")
     if not campaign["products"]:
         raise HTTPException(status_code=400, detail="Carga productos antes de ejecutar la campaña.")
+    if request.capture_mode == "cloud":
+        try:
+            sitemap_id = assert_retail_cloud_allowed()
+        except CloudConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Modo Cloud preparado para sitemap {sitemap_id}, pero la importación robusta "
+                f"de resultados aún es experimental. {webhook_requirement_note()} "
+                "Usa capture_mode=local para evidencias auditables PNG."
+            ),
+        )
     if request.method == "playwright" and importlib.util.find_spec("playwright") is None:
         raise HTTPException(status_code=400, detail="El navegador de captura no está instalado.")
-    if request.only_failed and not (campaign["summary"]["error"] + campaign["summary"]["no_price"]):
+    failed_like = (
+        campaign["summary"]["error"]
+        + campaign["summary"]["no_price"]
+        + campaign["summary"].get("blocked", 0)
+        + campaign["summary"].get("needs_review", 0)
+    )
+    if request.only_failed and not failed_like:
         raise HTTPException(status_code=400, detail="No hay productos fallidos para reintentar.")
 
     timestamp = now_iso()
+    _CANCEL_REQUESTED.discard(campaign_id)
     with db() as connection:
         if request.only_failed:
             connection.execute(
-                "UPDATE products SET status = 'pending', error = NULL, updated_at = ? WHERE campaign_id = ? AND status IN ('error', 'no_price')",
+                "UPDATE products SET status = 'pending', error = NULL, updated_at = ? WHERE campaign_id = ? AND status IN ('error', 'no_price', 'blocked', 'needs_review')",
                 (timestamp, campaign_id),
             )
         else:
             connection.execute(
                 """
                 UPDATE products SET status = 'pending', detected_price = NULL, original_price = NULL,
-                    captured_at = NULL, screenshot_url = NULL, ip_used = NULL, error = NULL, updated_at = ?
+                    captured_at = NULL, screenshot_url = NULL, fallback_screenshot_url = NULL,
+                    evidence_source = 'retailer', evidence_confidence = 'official',
+                    ip_used = NULL, error = NULL, updated_at = ?
                 WHERE campaign_id = ?
                 """,
                 (timestamp, campaign_id),
             )
         connection.execute(
-            "UPDATE campaigns SET status = 'running', updated_at = ?, last_error = NULL WHERE id = ?",
-            (timestamp, campaign_id),
+            """
+            UPDATE campaigns
+            SET status = 'running', updated_at = ?, last_error = NULL,
+                run_started_at = ?, run_ended_at = NULL, capture_mode = ?,
+                cloud_job_id = NULL, cloud_status = NULL
+            WHERE id = ?
+            """,
+            (timestamp, timestamp, request.capture_mode, campaign_id),
         )
     background_tasks.add_task(run_campaign_job, campaign_id, request)
+    return campaign_payload(campaign_id)
+
+
+@app.post("/api/campaigns/{campaign_id}/cancel", status_code=202)
+def cancel_campaign(campaign_id: str) -> dict:
+    campaign = campaign_payload(campaign_id)
+    if campaign["status"] != "running":
+        raise HTTPException(status_code=400, detail="La campaña no está en ejecución.")
+    _CANCEL_REQUESTED.add(campaign_id)
+    logger.info("event=campaign_cancel_requested campaign=%s", campaign_id)
+    with db() as connection:
+        connection.execute(
+            "UPDATE campaigns SET last_error = ?, updated_at = ? WHERE id = ?",
+            ("Cancelación solicitada. La campaña se detendrá al terminar el lote actual.", now_iso(), campaign_id),
+        )
     return campaign_payload(campaign_id)
 
 
@@ -910,13 +1222,23 @@ def download_evidence(campaign_id: str) -> StreamingResponse:
     with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
         bundle.writestr(f"reporte-{slug(campaign['name'])}.csv", report_csv(campaign))
         for index, product in enumerate(campaign["products"], start=1):
-            screenshot_url = product["screenshot_url"]
-            if not screenshot_url:
-                continue
-            path = SCREENSHOTS_DIR / Path(screenshot_url).name
-            if path.exists() and path.is_file():
-                name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}.png"
-                bundle.write(path, f"evidencias/{name}")
+            official = product.get("screenshot_url")
+            if official and product.get("evidence_source") != "google_reference":
+                path = SCREENSHOTS_DIR / Path(official).name
+                if path.exists() and path.is_file():
+                    name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-oficial.png"
+                    bundle.write(path, f"evidencias/{name}")
+            elif official:
+                path = SCREENSHOTS_DIR / Path(official).name
+                if path.exists() and path.is_file():
+                    name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-referencia-google.png"
+                    bundle.write(path, f"evidencias-indirectas/{name}")
+            fallback = product.get("fallback_screenshot_url")
+            if fallback:
+                path = SCREENSHOTS_DIR / Path(fallback).name
+                if path.exists() and path.is_file():
+                    name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-referencia-google.png"
+                    bundle.write(path, f"evidencias-indirectas/{name}")
     archive.seek(0)
     filename = f"evidencias-{slug(campaign['name'])}.zip"
     return StreamingResponse(

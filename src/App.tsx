@@ -34,7 +34,9 @@ type ProductStatus =
   | "non_compliant"
   | "captured_unverified"
   | "no_price"
-  | "error";
+  | "error"
+  | "blocked"
+  | "needs_review";
 
 type Product = {
   id: string;
@@ -66,7 +68,12 @@ type CampaignSummary = {
   non_compliant: number;
   no_price: number;
   error: number;
+  blocked?: number;
+  needs_review?: number;
   evidence: number;
+  evidence_official?: number;
+  evidence_google?: number;
+  by_retailer?: Record<string, number>;
 };
 
 type Campaign = {
@@ -79,12 +86,24 @@ type Campaign = {
   source_filename: string | null;
   last_run_at: string | null;
   last_error: string | null;
+  run_started_at?: string | null;
+  run_ended_at?: string | null;
+  capture_mode?: "local" | "cloud" | string | null;
   summary: CampaignSummary;
   products: Product[];
   import?: {
     filename: string;
     count: number;
     unsupported_retailers: string[];
+    retailers_found?: string[];
+    retailers_count?: number;
+    by_retailer?: Record<string, number>;
+    empty_sku?: number;
+    empty_url?: number;
+    invalid_links_count?: number;
+    claimed_retails_in_filename?: number | null;
+    filename_retail_mismatch?: boolean;
+    summary_message?: string;
   };
 };
 
@@ -92,8 +111,11 @@ type ApiMessage = { detail?: string };
 type Tab = "products" | "evidence";
 
 const retailerLabels: Record<string, string> = {
+  abc_cl: "ABC",
+  claro_cl: "Claro",
   easy_cl: "Easy",
   falabella_cl: "Falabella",
+  hites_cl: "Hites",
   jumbo_cl: "Jumbo",
   paris_cl: "Paris",
   ripley_cl: "Ripley",
@@ -110,6 +132,8 @@ const statusLabels: Record<ProductStatus, string> = {
   captured_unverified: "Sin objetivo",
   no_price: "Sin precio",
   error: "Error",
+  blocked: "Bloqueado",
+  needs_review: "Requiere revisión",
 };
 
 const campaignStatusLabels: Record<Campaign["status"], string> = {
@@ -154,7 +178,12 @@ function formatDateTime(value: string | null) {
 }
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } catch {
+    throw new Error("El backend no responde. ¿Está corriendo en http://127.0.0.1:8001?");
+  }
   const contentType = response.headers.get("content-type") ?? "";
   const payload = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
@@ -187,7 +216,7 @@ function StatusBadge({ status }: { status: ProductStatus }) {
         ? XCircle
         : status === "running"
           ? LoaderCircle
-          : status === "error" || status === "no_price"
+          : status === "error" || status === "no_price" || status === "blocked" || status === "needs_review"
             ? CircleAlert
             : Clock3;
   return (
@@ -248,7 +277,7 @@ function App() {
   const [apiStatus, setApiStatus] = useState<"checking" | "online" | "offline">("checking");
   const [browserAvailable, setBrowserAvailable] = useState(false);
   const [pageLoading, setPageLoading] = useState(true);
-  const [actionBusy, setActionBusy] = useState<"create" | "import" | "run" | "retry" | null>(null);
+  const [actionBusy, setActionBusy] = useState<"create" | "import" | "run" | "retry" | "cancel" | null>(null);
   const [notice, setNotice] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [tab, setTab] = useState<Tab>("products");
   const [query, setQuery] = useState("");
@@ -367,7 +396,20 @@ function App() {
       const unsupported = imported.import?.unsupported_retailers.length
         ? ` Revisa retailers no soportados: ${imported.import.unsupported_retailers.join(", ")}.`
         : "";
-      setNotice({ tone: unsupported ? "error" : "success", text: `${imported.summary.total} productos cargados.${unsupported}` });
+      const mismatch = imported.import?.filename_retail_mismatch
+        ? ` Ojo: el archivo se llama como si tuviera ${imported.import.claimed_retails_in_filename} retails, pero detectamos ${imported.import.retailers_count}.`
+        : "";
+      const empties = [
+        imported.import?.empty_sku ? `${imported.import.empty_sku} sin SKU` : null,
+        imported.import?.empty_url ? `${imported.import.empty_url} sin URL` : null,
+        imported.import?.invalid_links_count ? `${imported.import.invalid_links_count} links inválidos` : null,
+      ].filter(Boolean).join(", ");
+      const detail = empties ? ` Detalle: ${empties}.` : "";
+      const tone = unsupported || mismatch || imported.import?.invalid_links_count ? "error" : "success";
+      setNotice({
+        tone,
+        text: `${imported.import?.summary_message ?? `${imported.summary.total} productos cargados.`}${mismatch}${unsupported}${detail}`,
+      });
     } catch (error) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "No pudimos leer el archivo." });
     } finally {
@@ -378,6 +420,10 @@ function App() {
 
   async function executeCampaign(onlyFailed = false) {
     if (!active) return;
+    if (active.status === "running" || actionBusy === "run" || actionBusy === "retry") {
+      setNotice({ tone: "error", text: "La campaña ya está en curso. Evita el doble clic." });
+      return;
+    }
     setActionBusy(onlyFailed ? "retry" : "run");
     setNotice(null);
     try {
@@ -388,6 +434,8 @@ function App() {
           method: browserAvailable ? "playwright" : "curl",
           screenshot: browserAvailable,
           only_failed: onlyFailed,
+          capture_mode: "local",
+          google_fallback: true,
         }),
       });
       setActive(started);
@@ -395,6 +443,23 @@ function App() {
       setNotice({ tone: "success", text: onlyFailed ? "Reintentando productos con problemas." : "Captura iniciada. Puedes seguir el progreso aquí." });
     } catch (error) {
       setNotice({ tone: "error", text: error instanceof Error ? error.message : "No pudimos iniciar la captura." });
+    } finally {
+      setActionBusy(null);
+    }
+  }
+
+
+  async function cancelCampaign() {
+    if (!active || active.status !== "running") return;
+    setActionBusy("cancel");
+    setNotice(null);
+    try {
+      const stopped = await api<Campaign>(`/api/campaigns/${active.id}/cancel`, { method: "POST" });
+      setActive(stopped);
+      setCampaigns((current) => current.map((campaign) => (campaign.id === stopped.id ? stopped : campaign)));
+      setNotice({ tone: "success", text: "Cancelación pedida. Se detiene al terminar el lote actual." });
+    } catch (error) {
+      setNotice({ tone: "error", text: error instanceof Error ? error.message : "No pudimos cancelar la campaña." });
     } finally {
       setActionBusy(null);
     }
@@ -410,9 +475,9 @@ function App() {
     });
   }, [active, query, statusFilter]);
 
-  const evidenceProducts = active?.products.filter((product) => product.screenshot_url) ?? [];
+  const evidenceProducts = active?.products.filter((product) => product.screenshot_url || product.fallback_screenshot_url) ?? [];
   const progress = active?.summary.total ? Math.round((active.summary.processed / active.summary.total) * 100) : 0;
-  const issueCount = (active?.summary.error ?? 0) + (active?.summary.no_price ?? 0);
+  const issueCount = (active?.summary.error ?? 0) + (active?.summary.no_price ?? 0) + (active?.summary.blocked ?? 0) + (active?.summary.needs_review ?? 0);
   const runningProduct = active?.products.find((product) => product.status === "running");
 
   return (
@@ -490,6 +555,9 @@ function App() {
                     <span>{formatDate(active.start_date)} — {formatDate(active.end_date)}</span>
                     <i />
                     <span>Última ejecución: {formatDateTime(active.last_run_at)}</span>
+                    {active.run_started_at && <><i /><span>Inicio corrida: {formatDateTime(active.run_started_at)}</span></>}
+                    {active.run_ended_at && <><i /><span>Fin corrida: {formatDateTime(active.run_ended_at)}</span></>}
+                    <i /><span>Modo: {active.capture_mode === "cloud" ? "Cloud" : "Local"}</span>
                   </div>
                 </div>
                 <div className="head-actions">
@@ -508,8 +576,33 @@ function App() {
                     {active.status === "running" || actionBusy === "run" ? <LoaderCircle className="spin" size={17} /> : <Play size={17} />}
                     {active.status === "running" ? "Capturando…" : "Ejecutar campaña"}
                   </button>
+                  {active.status === "running" && (
+                    <button className="button button-secondary" onClick={() => void cancelCampaign()} disabled={actionBusy === "cancel"} type="button">
+                      {actionBusy === "cancel" ? <LoaderCircle className="spin" size={17} /> : <X size={17} />}
+                      Cancelar
+                    </button>
+                  )}
                 </div>
               </section>
+
+              {active.summary.by_retailer && Object.keys(active.summary.by_retailer).length > 0 && (
+                <section className="retailer-summary" aria-label="Resumen por retail">
+                  {Object.entries(active.summary.by_retailer).map(([retailer, count]) => (
+                    <article key={retailer} className="retailer-pill">
+                      <Store size={15} />
+                      <strong>{retailerLabels[retailer] ?? retailer}</strong>
+                      <span>{count} SKU</span>
+                    </article>
+                  ))}
+                  {active.import?.filename_retail_mismatch && (
+                    <article className="retailer-pill warn">
+                      <CircleAlert size={15} />
+                      <strong>Nombre vs contenido</strong>
+                      <span>Archivo sugiere {active.import.claimed_retails_in_filename}, hay {active.import.retailers_count}</span>
+                    </article>
+                  )}
+                </section>
+              )}
 
               <section className="workflow-card" aria-label="Flujo de campaña">
                 <div className={active.summary.total ? "workflow-step done" : "workflow-step current"}>
@@ -619,8 +712,10 @@ function App() {
                                 </td>
                                 <td><StatusBadge status={product.status} /></td>
                                 <td>
-                                  {product.screenshot_url ? (
-                                    <button className="evidence-button" type="button" onClick={() => setPreview(product)}><Eye size={16} /> Ver</button>
+                                  {(product.screenshot_url || product.fallback_screenshot_url) ? (
+                                    <button className="evidence-button" type="button" onClick={() => setPreview(product)}>
+                                      <Eye size={16} /> {product.evidence_source === "google_reference" || (!product.screenshot_url && product.fallback_screenshot_url) ? "Google" : "Ver"}
+                                    </button>
                                   ) : product.error ? (
                                     <span className="error-hint" title={product.error}>Ver error</span>
                                   ) : <span className="muted">Pendiente</span>}
@@ -637,14 +732,14 @@ function App() {
                   <div className="evidence-grid">
                     {evidenceProducts.map((product) => (
                       <button className="evidence-card" key={product.id} type="button" onClick={() => setPreview(product)}>
-                        <div className="evidence-image"><img src={product.screenshot_url ?? ""} alt={`Evidencia SKU ${product.sku}`} loading="lazy" /></div>
-                        <div><span>{product.evidence_source === "google_reference" ? "Referencia Google · baja confianza" : (retailerLabels[product.retailer] ?? product.retailer)}</span><strong>SKU {product.sku}</strong><small>{formatDateTime(product.captured_at)}</small></div>
+                        <div className="evidence-image"><img src={product.screenshot_url || product.fallback_screenshot_url || ""} alt={`Evidencia SKU ${product.sku}`} loading="lazy" /></div>
+                        <div><span>{product.evidence_source === "google_reference" || (!product.screenshot_url && product.fallback_screenshot_url) ? "Referencia Google · baja confianza" : (retailerLabels[product.retailer] ?? product.retailer)}</span><strong>SKU {product.sku}</strong><small>{formatDateTime(product.captured_at)}</small></div>
                         <ExternalLink size={16} />
                       </button>
                     ))}
                   </div>
                 ) : (
-                  <div className="panel-empty compact-empty"><div><ImageIcon size={27} /></div><h2>Aún no hay evidencias</h2><p>Ejecuta la campaña en modo Browser para generar un pantallazo verificable por SKU.</p></div>
+                  <div className="panel-empty compact-empty"><div><ImageIcon size={27} /></div><h2>Aún no hay evidencias locales</h2><p>Ejecuta la campaña en modo local (Playwright) para generar PNG auditables. Cloud no cuenta como evidencia oficial hasta importar pantallazos reales.</p></div>
                 )}
               </section>
             </>

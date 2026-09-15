@@ -9,3 +9,15 @@ backend/data/
 backend/test-data/
 backend/__pycache__/
 pricebot/**/__pycache__/
+
+.venv/
+venv/
+outputs/
+.tmp-remote-main/
+workbook-build/
+scripts/_patch_*.py
+scripts/_fix_*.py
+scripts/_probe_*.py
+backend/data/smoke-results/
+*.sqlite3
+*.sqlite3-*

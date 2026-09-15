@@ -31,7 +31,6 @@ CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-blink-features=AutomationControlled",
     "--disable-extensions",
     "--disable-background-networking",
     "--no-first-run",
@@ -40,7 +39,7 @@ CHROMIUM_ARGS = [
 ]
 
 NAVIGATION_TIMEOUT_MS = 25_000
-WAIT_SELECTOR_TIMEOUT_MS = 2_000
+WAIT_SELECTOR_TIMEOUT_MS = 5_000
 DEFAULT_TIMEOUT_MS = 25_000
 MAX_BROWSER_ATTEMPTS = 2
 CLOSE_TIMEOUT_S = 10
@@ -60,17 +59,12 @@ def _is_browser_crash(exc: Exception) -> bool:
 
 
 async def _apply_stealth(page) -> None:
-    """Patch residual headless fingerprints when playwright-stealth is installed."""
-    try:
-        from playwright_stealth import stealth_async  # playwright-stealth 1.x
-    except ImportError:
-        try:
-            from playwright_stealth import Stealth  # playwright-stealth 2.x
-        except ImportError:
-            return
-        await Stealth().apply_stealth_async(page)
-        return
-    await stealth_async(page)
+    """Intentionally a no-op.
+
+    Radar Retail records blocks honestly. We do not spoof browser fingerprints,
+    rotate free proxies, or attempt to bypass CAPTCHA / Cloudflare challenges.
+    """
+    return
 
 
 async def _close(*resources) -> None:
@@ -185,27 +179,38 @@ class PlaywrightFetcher(ProductFetcher):
         started = time.perf_counter()
         result = self.empty_result(product_url)
         result["ip_used"] = ip_used
+        html = ""
 
         page = await context.new_page()
-        await _apply_stealth(page)
+        await _apply_stealth(page)  # no-op: we do not spoof fingerprints
+        retailer_name = self.__class__.__name__
         try:
             response = await page.goto(product_url, wait_until="domcontentloaded",
                                        timeout=NAVIGATION_TIMEOUT_MS)
             result["http_status"] = response.status if response is not None else None
-            retailer_name = self.__class__.__name__
-            logger.info("event=navigate retailer=%s sku=%s url=%s http_status=%s ip=%s", retailer_name, item.get("sku", ""), product_url.split("?", 1)[0], result["http_status"], ip_used or "-")
-            # A 404 means the product is gone, not that the attempt failed. The curl
-            # transport reports it the same way; the two must not disagree.
+            logger.info(
+                "event=page_request retailer=%s sku=%s url=%s http_status=%s ip=%s",
+                retailer_name, item.get("sku", ""), product_url.split("?", 1)[0],
+                result["http_status"], ip_used or "-",
+            )
             if response is not None and response.status == 404:
                 result["status"] = "PRODUCT_NOT_FOUND"
+                if item.get("screenshot_to"):
+                    await self._screenshot(page, item["screenshot_to"], result)
                 return result
+
+            # Give JS-heavy PDPs a bit more time; still no challenge solving.
             try:
-                await page.wait_for_selector(self.WAIT_SELECTOR,
-                                             timeout=WAIT_SELECTOR_TIMEOUT_MS)
+                await page.wait_for_selector(self.WAIT_SELECTOR, timeout=WAIT_SELECTOR_TIMEOUT_MS)
             except Exception:
-                pass  # the price may already be in the DOM, or absent entirely
+                pass
+            try:
+                await page.wait_for_load_state("networkidle", timeout=4_000)
+            except Exception:
+                pass
 
             html = await page.content()
+            # Always capture visual evidence of whatever loaded (PDP or block page).
             if item.get("screenshot_to"):
                 await self._screenshot(page, item["screenshot_to"], result)
         finally:
@@ -217,8 +222,29 @@ class PlaywrightFetcher(ProductFetcher):
             result["block_type"] = "retailer_http_block"
         if result.get("error") == "Blocked by an anti-bot challenge":
             result["block_type"] = "anti_bot_challenge"
-            logger.warning("event=anti_bot_challenge retailer=%s sku=%s url=%s", retailer_name, item.get("sku", ""), product_url.split("?", 1)[0])
-        logger.info("event=parsed retailer=%s sku=%s price=%s status=%s error=%s duration_ms=%s", retailer_name, item.get("sku", ""), result.get("new_price"), result.get("status", ""), str(result.get("error", ""))[:120], round((time.perf_counter() - started) * 1000))
+            logger.warning(
+                "event=page_blocked retailer=%s sku=%s url=%s reason=anti_bot_challenge",
+                retailer_name, item.get("sku", ""), product_url.split("?", 1)[0],
+            )
+            # Respectful pause after a challenge so we do not hammer the site.
+            try:
+                pause_s = max(0.0, float(os.getenv("PRICEBOT_BLOCK_PAUSE_SECONDS", "8")))
+            except ValueError:
+                pause_s = 8.0
+            if pause_s:
+                await asyncio.sleep(pause_s)
+        if result.get("screenshot_path"):
+            logger.info(
+                "event=screenshot_saved retailer=%s sku=%s path=%s blocked=%s",
+                retailer_name, item.get("sku", ""), result.get("screenshot_path"),
+                bool(result.get("block_type")),
+            )
+        logger.info(
+            "event=price_parsed retailer=%s sku=%s price=%s status=%s error=%s duration_ms=%s",
+            retailer_name, item.get("sku", ""), result.get("new_price"),
+            result.get("status", ""), str(result.get("error", ""))[:120],
+            round((time.perf_counter() - started) * 1000),
+        )
         return result
 
     @staticmethod

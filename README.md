@@ -31,7 +31,7 @@ http://127.0.0.1:5173/
 API local:
 
 ```text
-http://127.0.0.1:8000/
+http://127.0.0.1:8001/
 ```
 
 ## Observabilidad y bloqueos
@@ -90,3 +90,19 @@ npx @railway/cli up
 ```
 
 Railway debe tener un plan activo. Si la cuenta esta en trial expirado, el CLI no permite crear ni desplegar servicios.
+
+
+## Walmart / Ripley (protecciones)
+
+Estos retailers suelen mostrar CAPTCHA o Cloudflare. Radar Retail:
+
+- guarda el pantallazo del desafío como evidencia de bloqueo;
+- marca el producto como `blocked` / `needs_review`;
+- soporta proxy autorizado por variable de entorno;
+- **no** resuelve CAPTCHA ni evade Cloudflare.
+
+```powershell
+$env:PRICEBOT_PROXY_RIPLEY_CL = "http://usuario:clave@host:puerto"
+$env:PRICEBOT_PROXY_WALMART_CL = "http://usuario:clave@host:puerto"
+$env:PRICEBOT_BLOCK_PAUSE_SECONDS = "8"
+```
