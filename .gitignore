@@ -15,6 +15,7 @@ venv/
 outputs/
 .tmp-remote-main/
 workbook-build/
+.railway-deploy/
 scripts/_patch_*.py
 scripts/_fix_*.py
 scripts/_probe_*.py

@@ -86,6 +86,12 @@ async def _close(*resources) -> None:
 class PlaywrightFetcher(ProductFetcher):
     """Fetches product pages with headless Chromium."""
 
+    # Retailers can opt into a documented responsive layout without changing the
+    # capture pipeline. The default remains desktop for existing integrations.
+    VIEWPORT = {"width": 1920, "height": 1080}
+    USER_AGENT = USER_AGENT
+    MOBILE_CONTEXT = False
+
     async def fetch(self, sku: str, url: Optional[str] = None, *,
                     screenshot_to: Optional[str] = None,
                     proxy: Optional[str] = None) -> dict:
@@ -161,13 +167,15 @@ class PlaywrightFetcher(ProductFetcher):
 
     async def _new_context(self, browser, playwright_proxy):
         kwargs = {
-            "viewport": {"width": 1920, "height": 1080},
-            "user_agent": USER_AGENT,
+            "viewport": self.VIEWPORT,
+            "user_agent": self.USER_AGENT,
             "locale": self.LOCALE,
             "timezone_id": self.TIMEZONE,
             "ignore_https_errors": True,
             "extra_http_headers": {"Accept-Language": f"{self.LOCALE},en;q=0.8"},
         }
+        if self.MOBILE_CONTEXT:
+            kwargs.update({"is_mobile": True, "has_touch": True, "device_scale_factor": 2})
         if playwright_proxy:
             kwargs["proxy"] = playwright_proxy
         context = await browser.new_context(**kwargs)
@@ -212,6 +220,7 @@ class PlaywrightFetcher(ProductFetcher):
             html = await page.content()
             # Always capture visual evidence of whatever loaded (PDP or block page).
             if item.get("screenshot_to"):
+                await self._prepare_screenshot(page, result)
                 await self._screenshot(page, item["screenshot_to"], result)
         finally:
             await _close(page)
@@ -247,13 +256,19 @@ class PlaywrightFetcher(ProductFetcher):
         )
         return result
 
-    @staticmethod
-    async def _screenshot(page, path: str, result: dict) -> None:
+    async def _prepare_screenshot(self, page, result: dict) -> None:
+        """Allow a retailer to position a responsive page before capture."""
+        return
+
+    async def _screenshot(self, page, path: str, result: dict) -> None:
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             # Aporte evidence must include the product price even when it sits below
             # the first viewport. The UI presents the full image in a scrollable viewer.
-            await page.screenshot(path=path, full_page=True)
+            # Mobile retailer captures are intentionally viewport-sized after the
+            # retailer hook scrolls to the price; this avoids producing a tall image
+            # whose visible section is reviews or recommendations.
+            await page.screenshot(path=path, full_page=not self.MOBILE_CONTEXT)
             result["screenshot_path"] = str(path)
         except Exception as exc:
             result["screenshot_error"] = str(exc)

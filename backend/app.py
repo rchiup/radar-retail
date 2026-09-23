@@ -15,7 +15,7 @@ from urllib.parse import quote_plus, urlparse
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -185,6 +185,23 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_products_campaign ON products(campaign_id);
             CREATE INDEX IF NOT EXISTS idx_products_status ON products(campaign_id, status);
+
+            CREATE TABLE IF NOT EXISTS price_observations (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+                product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                sku TEXT NOT NULL DEFAULT '',
+                retailer TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                price REAL,
+                status TEXT NOT NULL,
+                evidence_source TEXT NOT NULL DEFAULT 'retailer',
+                screenshot_url TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_price_observations_product
+                ON price_observations(sku, retailer, observed_at);
             """
         )
         for column, definition in (("fallback_screenshot_url", "TEXT"), ("evidence_source", "TEXT NOT NULL DEFAULT 'retailer'"), ("evidence_confidence", "TEXT NOT NULL DEFAULT 'official'")):
@@ -520,6 +537,7 @@ def render_indirect_evidence_card(
     search_url: str,
     captured_at: datetime,
     note: str,
+    source_label: str = "referencia publica",
 ) -> None:
     """Clean internal MVP evidence card.
 
@@ -571,7 +589,7 @@ def render_indirect_evidence_card(
     meta = [
         f"Fecha: {captured_at.strftime('%Y-%m-%d %H:%M:%S')} Chile",
         f"URL: {(product_url or '-')[:108]}",
-        f"Fuente de precio: referencia publica",
+        f"Fuente de precio: {source_label}",
         note[:140] if note else "",
     ]
     for line in meta:
@@ -694,7 +712,29 @@ def store_capture(
         outcome["evidence_source"] = "retailer"
         outcome["evidence_confidence"] = "official"
     if screenshot_path and screenshot_path.exists():
-        annotate_screenshot(screenshot_path, request, outcome, captured_at)
+        # Ripley's mobile response can expose the price in public structured data
+        # while rendering only its reviews component. Do not present that reviews
+        # page as price evidence: replace it with a transparent structured-data card.
+        if (
+            product["retailer"] == "ripley_cl"
+            and outcome.get("new_price") is not None
+            and outcome.get("screenshot_focus") == "unavailable"
+        ):
+            render_indirect_evidence_card(
+                screenshot_path,
+                retailer="ripley_cl",
+                sku=product["sku"],
+                product_url=product["url"],
+                google_price=outcome.get("new_price"),
+                search_url=product["url"],
+                captured_at=captured_at,
+                note="La versión móvil entregó reseñas; el precio proviene del JSON-LD público de la ficha.",
+                source_label="datos estructurados públicos de Ripley",
+            )
+            outcome["evidence_source"] = "retailer_structured"
+            outcome["evidence_confidence"] = "medium"
+        else:
+            annotate_screenshot(screenshot_path, request, outcome, captured_at)
     # If the official page is blocked/empty, keep it and add a separate Google
     # reference screenshot. Google evidence is never treated as official compliance.
     fallback = None
@@ -784,6 +824,27 @@ def store_capture(
                 outcome.get("error"),
                 now_iso(),
                 product_id,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO price_observations
+                (id, campaign_id, product_id, sku, retailer, observed_at, price, status,
+                 evidence_source, screenshot_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid4().hex,
+                campaign["id"],
+                product_id,
+                product["sku"] or "",
+                product["retailer"],
+                captured_at.isoformat(timespec="seconds"),
+                detected_number,
+                status,
+                outcome.get("evidence_source", "retailer"),
+                screenshot_url or fallback_url,
+                now_iso(),
             ),
         )
     logger.info(
@@ -1034,6 +1095,38 @@ def create_campaign(request: CampaignCreate) -> dict:
 @app.get("/api/campaigns/{campaign_id}")
 def get_campaign(campaign_id: str) -> dict:
     return campaign_payload(campaign_id)
+
+
+@app.get("/api/campaigns/{campaign_id}/price-history")
+def price_history(
+    campaign_id: str,
+    sku: str | None = Query(default=None),
+    retailer: str | None = Query(default=None),
+) -> dict:
+    campaign_payload(campaign_id)
+    clauses = ["campaign_id = ?"]
+    values: list[str] = [campaign_id]
+    if sku:
+        clauses.append("sku = ?")
+        values.append(sku.strip())
+    if retailer:
+        clauses.append("retailer = ?")
+        values.append(retailer.strip())
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT id, product_id, sku, retailer, observed_at, price, status, evidence_source, screenshot_url "
+            f"FROM price_observations WHERE {' AND '.join(clauses)} ORDER BY observed_at DESC",
+            values,
+        ).fetchall()
+    observations = [dict(row) for row in rows]
+    priced = [row["price"] for row in observations if row["price"] is not None]
+    return {
+        "observations": observations,
+        "count": len(observations),
+        "min_price": min(priced) if priced else None,
+        "max_price": max(priced) if priced else None,
+        "latest_price": priced[0] if priced else None,
+    }
 
 
 @app.post("/api/campaigns/{campaign_id}/import")
@@ -1299,7 +1392,27 @@ async def fetch_price_for_product(request: PriceRequest) -> dict:
         raise HTTPException(status_code=502, detail="El retail no respondió correctamente. Intenta nuevamente.") from exc
     captured_at = datetime.now().astimezone()
     if screenshot_path:
-        await run_in_threadpool(annotate_screenshot, screenshot_path, request, result, captured_at)
+        if (
+            request.retail == "ripley_cl"
+            and result.get("new_price") is not None
+            and result.get("screenshot_focus") == "unavailable"
+        ):
+            await run_in_threadpool(
+                render_indirect_evidence_card,
+                screenshot_path,
+                retailer="ripley_cl",
+                sku=sku_value or "",
+                product_url=url_value,
+                google_price=result.get("new_price"),
+                search_url=url_value or "",
+                captured_at=captured_at,
+                note="La versión móvil entregó reseñas; el precio proviene del JSON-LD público de la ficha.",
+                source_label="datos estructurados públicos de Ripley",
+            )
+            result["evidence_source"] = "retailer_structured"
+            result["evidence_confidence"] = "medium"
+        else:
+            await run_in_threadpool(annotate_screenshot, screenshot_path, request, result, captured_at)
     fallback_url = None
     if request.google_fallback and result.get("new_price") is None:
         fallback_path = SCREENSHOTS_DIR / f"google-{request.retail}-{slug(sku_value or 'url')}-{uuid4().hex[:10]}.png"
