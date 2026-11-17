@@ -1,108 +1,83 @@
-# Radar Retail MVP
+# Radar Retail
 
-MVP de monitoreo de precios retail con React + FastAPI + pricebot.
+Inteligencia comercial con React, FastAPI, SQLite, Pricebot y Playwright. Conserva campañas, carga Excel/CSV, capturas, historial, reportes CSV y ZIP de evidencias.
 
-## Funcionalidad
-
-- Campanas de monitoreo.
-- Carga de productos desde CSV o XLSX.
-- Tabla de precio base, precio nuevo, menor mercado y brecha.
-- Matriz historica por fecha.
-- Captura real con pricebot.
-- Screenshots con fecha/hora, campana, SKU, precio, URL e IP incrustados en la imagen.
-- Export CSV de analisis.
-
-## Desarrollo local
+## Ejecutar y mostrar
 
 ```powershell
 npm install
+python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
-.\.venv\Scripts\playwright.exe install chromium
+```
+
+En dos terminales:
+
+```powershell
 npm run api
+```
+
+```powershell
 npm run dev
 ```
 
-Front local:
+Abrir [Radar Retail local](http://127.0.0.1:5173/). Acceso directo a la [demo comercial](http://127.0.0.1:5173/?demo=1): 50 SKU ficticios, promociones, grupos comparables, inventario e históricos. La demo funciona con solo `npm run dev`, sin API, scraping, credenciales ni servicios externos. Los datos y respaldos de demostración están identificados como DEMO y no son pantallazos oficiales.
 
-```text
-http://127.0.0.1:5173/
-```
+Recorrido comercial sugerido: Centro de inteligencia → Auditoría promocional → Competencia → Riesgo de quiebres → Radar Brief. Desde el brief se puede imprimir o guardar como PDF.
 
-API local:
-
-```text
-http://127.0.0.1:8001/
-```
-
-## Observabilidad y bloqueos
-
-Cada corrida escribe eventos estructurados en la consola de Uvicorn y en
-`backend/data/radar-retail.log` (en Railway, en el volumen configurado por
-`RADAR_DATA_DIR`). Se registran campaña, retail, SKU, URL sin query string,
-duración, estado HTTP, IP de salida, precio detectado, evidencia y error.
-No se guardan cookies, credenciales ni tokens de URL.
-
-Un CAPTCHA o desafío anti-bot queda registrado como `anti_bot_challenge` para
-revisión manual. El sistema no intenta evadirlo ni rota IPs automáticamente:
-para operar de forma legítima hay que respetar robots.txt, términos del sitio,
-límites de frecuencia y usar una integración/autorización del retail cuando
-esté disponible.
-
-Para una integración autorizada se puede definir un proxy por retailer (sin
-compartir credenciales entre servicios) y una pausa mínima entre páginas:
+Para capturas reales, instalar Chromium una sola vez:
 
 ```powershell
-$env:PRICEBOT_PROXY_RIPLEY_CL = "http://usuario:clave@host:puerto"
-$env:PRICEBOT_PROXY_WALMART_CL = "http://usuario:clave@host:puerto"
-$env:PRICEBOT_DELAY_SECONDS = "2.5"
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-Usa estos perfiles solo con proveedores y sitios que hayan aprobado la
-recolección. Google puede servir para descubrir una URL, pero no reemplaza la
-captura de la página oficial: sus snippets pueden estar desactualizados y no
-constituyen evidencia de precio.
+## Archivos de entrada
 
-## Formato de carga
+Se aceptan `.csv` y `.xlsx`, hasta 12 MB y 5.000 filas. CSV admite coma o punto y coma. Los ejemplos están en `samples/`.
 
-El archivo puede ser `.csv` o `.xlsx`. Columnas soportadas:
+Auditoría promocional:
 
-```text
-sku, descripcion, url, retailer, categoria, precio_base, precio_nuevo
+```csv
+sku,nombre,retailer,url,pvp,precio_campana
+SKU-001,Producto A,falabella_cl,https://www.falabella.com/falabella-cl/product/ID/PRODUCTO,49990,39990
 ```
 
-Tambien acepta el formato que usa Experto Retail:
+También acepta `SKU`, `Link`, `PVP`, `PVP Descuento`. En XLSX el nombre de la hoja puede definir el retail. Usar links HTTPS directos a cada producto. El precio observado se obtiene al ejecutar la campaña; un archivo sin precio objetivo permite capturar, pero no determinar cumplimiento.
 
-```text
-SKU, Link, PVP, PVP Descuento
+Comparables:
+
+```csv
+grupo_comparable,sku,nombre,retailer,precio,fecha
+MODELO-A,SKU-001,Producto A,falabella_cl,39990,2026-11-16
+MODELO-A,SKU-002,Producto A,paris_cl,42990,2026-11-16
 ```
 
-En XLSX, el nombre de la hoja (por ejemplo `Falabella`) se usa como retail. Tambien acepta alias como
-`sku_retail`, `link`, `cadena`, `nombre`, `producto`, `precio_objetivo`.
+Compartir `grupo_comparable` significa asociar explícitamente productos equivalentes. El sistema no empareja productos por similitud de nombre. Importar solo equivalencias verificadas, incluyendo variante, capacidad y condición de venta.
 
-## Railway
+Inventario:
 
-El proyecto incluye `Dockerfile` y `railway.json`.
+```csv
+sku,nombre,retailer,stock,ventas_30d,lead_time,stock_seguridad
+SKU-001,Producto A,falabella_cl,20,90,10,5
+```
+
+Velocidad = ventas de 30 días / 30 (o `venta_diaria` importada). Cobertura = stock disponible después del stock de seguridad / velocidad. Riesgo crítico: cobertura ≤ lead time; alto: ≤ 1,5 × lead time; medio: ≤ 2,5 × lead time. Los datos faltantes se muestran como insuficientes. Son reglas operativas basadas en venta promedio, sin forecast avanzado.
+
+## Validación
 
 ```powershell
-npx @railway/cli login
-npx @railway/cli init --name radar-retail-mvp --json
-npx @railway/cli up
+npm run build
+.\.venv\Scripts\python.exe -m pip install -r tests\requirements.txt
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe tests\e2e_demo.py
+.\.venv\Scripts\python.exe tests\e2e_workspace.py
 ```
 
-Railway debe tener un plan activo. Si la cuenta esta en trial expirado, el CLI no permite crear ni desplegar servicios.
+## Acceso y persistencia
 
+La API local está en `http://127.0.0.1:8001`. Para acceso remoto, configurar `RADAR_ACCESS_TOKEN` en el servidor y entrar desde la pantalla de acceso. No guardar el secreto en Git ni en el frontend.
 
-## Walmart / Ripley (protecciones)
+Docker y Railway se mantienen. Montar volumen persistente en `/data` y usar `RADAR_DATA_DIR=/data`; ahí se guardan SQLite, capturas y logs. Desplegar explícitamente al servicio existente, evitando crear otro proyecto por accidente.
 
-Estos retailers suelen mostrar CAPTCHA o Cloudflare. Radar Retail:
+Los desafíos anti-bot quedan registrados para revisión; la plataforma no los evade. El historial, la fuente y la confianza distinguen capturas oficiales, datos estructurados y referencias indirectas. El brief se genera mediante cálculos y reglas sobre los datos cargados.
 
-- guarda el pantallazo del desafío como evidencia de bloqueo;
-- marca el producto como `blocked` / `needs_review`;
-- soporta proxy autorizado por variable de entorno;
-- **no** resuelve CAPTCHA ni evade Cloudflare.
-
-```powershell
-$env:PRICEBOT_PROXY_RIPLEY_CL = "http://usuario:clave@host:puerto"
-$env:PRICEBOT_PROXY_WALMART_CL = "http://usuario:clave@host:puerto"
-$env:PRICEBOT_BLOCK_PAUSE_SECONDS = "8"
-```
+Dependencias y licencias: [DEPENDENCIES.md](DEPENDENCIES.md).

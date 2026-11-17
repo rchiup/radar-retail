@@ -7,3 +7,10 @@ backend/screenshots/*.png
 backend/data
 pricebot/**/__pycache__
 *.log
+.env
+.env.*
+.pytest_cache
+tests
+outputs
+workbook-build
+.railway-deploy

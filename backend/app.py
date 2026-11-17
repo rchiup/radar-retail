@@ -1,14 +1,18 @@
 import csv
+import hashlib
+import hmac
 import io
 import importlib.util
 import ipaddress
 import logging
+import math
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus, urlparse
@@ -17,7 +21,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import load_workbook
 from PIL import Image, ImageDraw, ImageFont
@@ -119,6 +123,114 @@ def config_value(name: str) -> str | None:
     return None
 
 
+SESSION_COOKIE = "radar_session"
+SESSION_SECONDS = 8 * 60 * 60
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+
+
+def local_request(request: Request) -> bool:
+    """Only direct loopback development can run without an access key."""
+    if os.getenv("RAILWAY_ENVIRONMENT_ID") or os.getenv("RADAR_REQUIRE_AUTH") == "1":
+        return False
+    peer = request.client.host if request.client else ""
+    hostname = request.url.hostname or ""
+    return peer in {"127.0.0.1", "::1"} and hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def valid_session(value: str | None, secret: str | None) -> bool:
+    if not value or not secret:
+        return False
+    try:
+        expires, nonce, signature = value.split(".")
+        payload = f"{expires}.{nonce}"
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return int(expires) > time.time() and hmac.compare_digest(signature, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def authenticated(request: Request) -> bool:
+    secret = config_value("RADAR_ACCESS_TOKEN")
+    return (not secret and local_request(request)) or valid_session(request.cookies.get(SESSION_COOKIE), secret)
+
+
+@app.middleware("http")
+async def protect_private_data(request: Request, call_next):
+    path = request.url.path
+    protected = path.startswith(("/api/", "/screenshots/")) or path in {"/docs", "/redoc", "/openapi.json"}
+    public = path in {"/api/health", "/api/auth/session", "/api/auth/login", "/api/auth/logout"}
+    if protected and not public and not authenticated(request):
+        configured = bool(config_value("RADAR_ACCESS_TOKEN"))
+        return JSONResponse(
+            {"detail": "Inicia sesión para acceder." if configured else "Configura RADAR_ACCESS_TOKEN en el servidor para habilitar el acceso remoto."},
+            status_code=401 if configured else 503,
+            headers={"Cache-Control": "no-store"},
+        )
+    if protected and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        if origin:
+            origin_url = urlparse(origin)
+            same_origin = origin_url.netloc.lower() == request.url.netloc.lower()
+            local_frontend = local_request(request) and origin_url.hostname in {"127.0.0.1", "localhost", "::1"}
+            if not same_origin and not local_frontend:
+                return JSONResponse({"detail": "Origen de solicitud no permitido."}, status_code=403)
+    response = await call_next(request)
+    if protected:
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
+class LoginRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=512)
+
+
+@app.get("/api/auth/session")
+def session_status(request: Request) -> dict:
+    return {
+        "authenticated": authenticated(request),
+        "required": bool(config_value("RADAR_ACCESS_TOKEN")) or not local_request(request),
+        "configured": bool(config_value("RADAR_ACCESS_TOKEN")),
+    }
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest, request: Request) -> Response:
+    secret = config_value("RADAR_ACCESS_TOKEN")
+    if not secret:
+        if local_request(request):
+            return JSONResponse({"authenticated": True, "required": False, "configured": False})
+        raise HTTPException(status_code=503, detail="El acceso remoto requiere RADAR_ACCESS_TOKEN configurado.")
+    peer = request.client.host if request.client else "unknown"
+    cutoff = time.time() - 900
+    attempts = [stamp for stamp in _LOGIN_ATTEMPTS.get(peer, []) if stamp > cutoff]
+    if len(attempts) >= 5:
+        raise HTTPException(status_code=429, detail="Demasiados intentos. Intenta nuevamente en 15 minutos.")
+    if not hmac.compare_digest(payload.token.encode(), secret.encode()):
+        if len(_LOGIN_ATTEMPTS) > 1000:
+            _LOGIN_ATTEMPTS.clear()
+        _LOGIN_ATTEMPTS[peer] = [*attempts, time.time()]
+        raise HTTPException(status_code=401, detail="Clave de acceso incorrecta.")
+    _LOGIN_ATTEMPTS.pop(peer, None)
+    cookie_payload = f"{int(time.time()) + SESSION_SECONDS}.{secrets.token_hex(16)}"
+    signature = hmac.new(secret.encode(), cookie_payload.encode(), hashlib.sha256).hexdigest()
+    response = JSONResponse({"authenticated": True, "required": True, "configured": True})
+    response.set_cookie(
+        SESSION_COOKIE, f"{cookie_payload}.{signature}", max_age=SESSION_SECONDS,
+        httponly=True, secure=request.url.scheme == "https" or bool(os.getenv("RAILWAY_ENVIRONMENT_ID")),
+        samesite="lax", path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout() -> Response:
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
 def safe_url(value: str | None) -> str:
     """Keep query strings/tokens out of logs while preserving host and path."""
     if not value:
@@ -202,6 +314,44 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_price_observations_product
                 ON price_observations(sku, retailer, observed_at);
+
+            CREATE TABLE IF NOT EXISTS comparable_prices (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+                group_id TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                retailer TEXT NOT NULL,
+                price REAL NOT NULL,
+                observed_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'import',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_comparables_campaign
+                ON comparable_prices(campaign_id, group_id);
+
+            CREATE TABLE IF NOT EXISTS inventory_metrics (
+                id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+                sku TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                retailer TEXT NOT NULL,
+                stock REAL,
+                sales_30d REAL,
+                daily_sales REAL,
+                lead_time_days REAL,
+                safety_stock REAL NOT NULL DEFAULT 0,
+                coverage_days REAL,
+                risk TEXT NOT NULL DEFAULT 'insufficient',
+                stockout_date TEXT,
+                action TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_campaign_sku_retailer
+                ON inventory_metrics(campaign_id, sku, retailer);
             """
         )
         for column, definition in (("fallback_screenshot_url", "TEXT"), ("evidence_source", "TEXT NOT NULL DEFAULT 'retailer'"), ("evidence_confidence", "TEXT NOT NULL DEFAULT 'official'")):
@@ -220,6 +370,10 @@ def init_db() -> None:
                 connection.execute(f"ALTER TABLE campaigns ADD COLUMN {column} {definition}")
             except sqlite3.OperationalError:
                 pass
+        try:
+            connection.execute("ALTER TABLE campaigns ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         connection.execute(
             "UPDATE products SET status = 'pending', error = 'La corrida anterior fue interrumpida.' WHERE status = 'running'"
         )
@@ -382,6 +536,121 @@ def parse_campaign_file(filename: str, content: bytes) -> list[dict[str, str | f
     return list(unique.values())
 
 
+def parse_tabular_file(filename: str, content: bytes) -> list[dict[str, str]]:
+    """Read CSV/XLSX rows without guessing business meaning."""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise ValueError("Formato no soportado. Usa un archivo CSV o XLSX.")
+    rows: list[dict[str, str]] = []
+    if suffix == ".xlsx":
+        workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+        for sheet in workbook.worksheets:
+            values = iter(sheet.iter_rows(values_only=True))
+            first_row = next(values, None)
+            if not first_row:
+                continue
+            headers = [normalize_header(cell_text(value)) for value in first_row]
+            for cells in values:
+                row = {
+                    headers[index]: cell_text(value)
+                    for index, value in enumerate(cells)
+                    if index < len(headers) and headers[index]
+                }
+                if any(row.values()):
+                    rows.append(row)
+                    if len(rows) > MAX_PRODUCTS:
+                        workbook.close()
+                        raise ValueError(f"El archivo supera el máximo de {MAX_PRODUCTS} filas.")
+        workbook.close()
+    else:
+        text = content.decode("utf-8-sig")
+        sample = text[:4096]
+        delimiter = ";" if sample.count(";") > sample.count(",") else ","
+        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+        rows = [
+            {normalize_header(key): cell_text(value) for key, value in raw.items() if key}
+            for raw in reader
+            if any(cell_text(value) for value in raw.values())
+        ]
+    if len(rows) > MAX_PRODUCTS:
+        raise ValueError(f"El archivo supera el máximo de {MAX_PRODUCTS} filas.")
+    return rows
+
+
+def inventory_row(row: dict[str, str]) -> dict:
+    sku = pick(row, ["sku", "codigo", "id"])
+    retailer = normalize_retailer(pick(row, ["retailer", "retail", "cadena", "tienda"]) or "general")
+    stock_value = pick(row, ["stock", "inventario", "unidades"])
+    sales_value = pick(row, ["ventas_30d", "sales_30d", "ventas_ultimos_30_dias"])
+    daily_value = pick(row, ["venta_diaria", "daily_sales", "velocidad_venta"])
+    lead_value = pick(row, ["lead_time", "lead_time_days", "plazo_reposicion", "dias_reposicion"])
+    safety_value = pick(row, ["stock_seguridad", "safety_stock"])
+    def nonnegative(value: str) -> float | None:
+        if not value:
+            return None
+        numeric = value.strip().replace("$", "").replace(" ", "")
+        if not re.fullmatch(r"\+?\d+(?:[.,]\d+)*", numeric):
+            return None
+        number = parse_number(numeric)
+        return number if math.isfinite(number) and number >= 0 else None
+
+    stock = nonnegative(stock_value)
+    sales_30d = nonnegative(sales_value)
+    daily_sales = nonnegative(daily_value) if daily_value else ((sales_30d / 30) if sales_30d is not None else None)
+    lead_time = nonnegative(lead_value)
+    safety_stock = nonnegative(safety_value) if safety_value else 0
+    invalid = any(value and nonnegative(value) is None for value in [stock_value, sales_value, daily_value, lead_value, safety_value])
+    if safety_stock is None:
+        safety_stock = 0
+    coverage = (max(stock - safety_stock, 0) / daily_sales) if stock is not None and daily_sales and daily_sales > 0 else None
+    # Exhaustion uses physical stock; replenishment coverage reserves safety stock.
+    stockout_date = (date.today() + timedelta(days=max(int(stock / daily_sales), 0))).isoformat() if stock is not None and daily_sales and daily_sales > 0 else None
+    if invalid:
+        risk = "insufficient"
+        action = "Corregir datos inválidos o negativos; usa números mayores o iguales a cero."
+        coverage = None
+        stockout_date = None
+    elif stock is not None and stock <= 0:
+        coverage = 0
+        risk = "critical"
+        action = "Sin stock disponible: reponer ahora y revisar compromisos de venta."
+        stockout_date = date.today().isoformat()
+    elif stock is not None and daily_sales == 0 and lead_time is not None:
+        risk = "low"
+        action = "Sin ventas en el período informado; no se estima agotamiento. Revisar rotación."
+        stockout_date = None
+    elif coverage is None or lead_time is None:
+        risk = "insufficient"
+        action = "Completar stock, ventas y lead time para calcular el riesgo."
+        stockout_date = None
+    elif coverage <= lead_time:
+        risk = "critical"
+        action = f"Reponer ahora: la cobertura ({coverage:.1f} días) no alcanza el lead time ({lead_time:.0f} días)."
+    elif coverage <= lead_time * 1.5:
+        risk = "high"
+        action = "Acelerar la orden de compra y revisar ventas diariamente."
+    elif coverage <= lead_time * 2.5:
+        risk = "medium"
+        action = "Programar reposición y monitorear la velocidad de venta."
+    else:
+        risk = "low"
+        action = "Cobertura saludable; mantener monitoreo semanal."
+    return {
+        "sku": sku,
+        "name": pick(row, ["nombre", "name", "producto", "descripcion"]),
+        "retailer": retailer,
+        "stock": stock,
+        "sales_30d": sales_30d,
+        "daily_sales": daily_sales,
+        "lead_time_days": lead_time,
+        "safety_stock": safety_stock,
+        "coverage_days": round(coverage, 1) if coverage is not None else None,
+        "risk": risk,
+        "stockout_date": stockout_date,
+        "action": action,
+    }
+
+
 def validate_retail_url(retailer: str, url: str | None) -> None:
     if not url:
         return
@@ -480,6 +749,214 @@ def campaign_payload(campaign_id: str) -> dict:
     return {**dict(campaign), "summary": counts, "products": products}
 
 
+DEMO_RETAILERS = ["falabella_cl", "paris_cl", "ripley_cl", "walmart_cl", "abc_cl"]
+DEMO_PRODUCTS = [
+    ("JBLGO4", "JBL Go 4", 49990),
+    ("JBLFLIP7", "JBL Flip 7", 129990),
+    ("JBLCHARGE6", "JBL Charge 6", 189990),
+    ("JBLXTREME4", "JBL Xtreme 4", 329990),
+    ("JBLPB120", "JBL PartyBox Club 120", 429990),
+    ("JBLT520", "JBL Tune 520BT", 44990),
+    ("JBLT770", "JBL Tune 770NC", 109990),
+    ("JBLWAVE", "JBL Wave Buds 2", 59990),
+    ("JBLLIVE", "JBL Live Beam 3", 159990),
+    ("JBLSB180", "JBL Soundbar SB180", 219990),
+]
+
+
+def seed_demo_campaign() -> dict:
+    """Create a coherent offline demo. All rows are explicitly marked as synthetic."""
+    with db() as connection:
+        existing = connection.execute(
+            "SELECT id FROM campaigns WHERE is_demo = 1 ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    if existing:
+        return campaign_payload(existing["id"])
+
+    campaign_id = uuid4().hex
+    timestamp = now_iso()
+    start = date.today() - timedelta(days=5)
+    end = date.today() + timedelta(days=5)
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO campaigns
+                (id, name, client, start_date, end_date, status, source_filename, created_at,
+                 updated_at, last_run_at, run_started_at, run_ended_at, capture_mode, is_demo)
+            VALUES (?, ?, ?, ?, ?, 'completed_with_errors', ?, ?, ?, ?, ?, ?, 'demo', 1)
+            """,
+            (
+                campaign_id, "DEMO · Portafolio Audio Chile", "Datos ficticios",
+                start.isoformat(), end.isoformat(), "demo-offline-50-sku.csv", timestamp,
+                timestamp, timestamp, timestamp, timestamp,
+            ),
+        )
+        for group_index, (base_sku, name, base_price) in enumerate(DEMO_PRODUCTS):
+            for retail_index, retailer in enumerate(DEMO_RETAILERS):
+                product_id = uuid4().hex
+                sku = f"{base_sku}-{retail_index + 1:02d}"
+                regular = round(base_price * (1.16 + retail_index * 0.018), -1)
+                target = round(base_price * (0.94 + (retail_index % 2) * 0.015), -1)
+                variation = ((group_index * 7 + retail_index * 11) % 19) - 8
+                observed = round(target * (1 + variation / 100), -1)
+                status = "compliant" if observed <= target else "non_compliant"
+                connection.execute(
+                    """
+                    INSERT INTO products (
+                        id, campaign_id, sku, name, category, retailer, url, regular_price,
+                        promo_price, detected_price, status, captured_at, evidence_source,
+                        evidence_confidence, error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'Audio', ?, '', ?, ?, ?, ?, ?, 'demo', 'demo', ?, ?, ?)
+                    """,
+                    (
+                        product_id, campaign_id, sku, name, retailer, regular, target, observed,
+                        status, timestamp,
+                        "Dato DEMO: resultado simulado, sin pantallazo ni evidencia oficial.",
+                        timestamp, timestamp,
+                    ),
+                )
+                for week in range(6, -1, -1):
+                    drift = ((group_index * 3 + retail_index * 5 + week * 2) % 13) - 6
+                    historic_price = observed if week == 0 else round(observed * (1 + drift / 100), -1)
+                    historic_status = "compliant" if historic_price <= target else "non_compliant"
+                    observed_at = (datetime.now().astimezone() - timedelta(days=week * 7)).isoformat(timespec="seconds")
+                    connection.execute(
+                        """
+                        INSERT INTO price_observations
+                            (id, campaign_id, product_id, sku, retailer, observed_at, price,
+                             status, evidence_source, screenshot_url, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'demo', NULL, ?)
+                        """,
+                        (uuid4().hex, campaign_id, product_id, sku, retailer, observed_at, historic_price, historic_status, timestamp),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO comparable_prices
+                        (id, campaign_id, group_id, sku, name, retailer, price, observed_at, source, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
+                    """,
+                    (uuid4().hex, campaign_id, base_sku, sku, name, retailer, observed, timestamp, timestamp),
+                )
+                stock = 18 + ((group_index * 17 + retail_index * 13) % 130)
+                sales_30d = 24 + ((group_index * 29 + retail_index * 19) % 170)
+                lead_time = 7 + ((group_index + retail_index * 3) % 18)
+                inventory = inventory_row({
+                    "sku": sku,
+                    "nombre": name,
+                    "retailer": retailer,
+                    "stock": str(stock),
+                    "ventas_30d": str(sales_30d),
+                    "lead_time": str(lead_time),
+                    "stock_seguridad": str(5 + group_index % 8),
+                })
+                connection.execute(
+                    """
+                    INSERT INTO inventory_metrics
+                        (id, campaign_id, sku, name, retailer, stock, sales_30d, daily_sales,
+                         lead_time_days, safety_stock, coverage_days, risk, stockout_date,
+                         action, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid4().hex, campaign_id, inventory["sku"], inventory["name"], inventory["retailer"],
+                        inventory["stock"], inventory["sales_30d"], inventory["daily_sales"],
+                        inventory["lead_time_days"], inventory["safety_stock"], inventory["coverage_days"],
+                        inventory["risk"], inventory["stockout_date"], inventory["action"], timestamp, timestamp,
+                    ),
+                )
+    return campaign_payload(campaign_id)
+
+
+def comparable_payload(campaign_id: str) -> dict:
+    campaign_payload(campaign_id)
+    with db() as connection:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT * FROM comparable_prices WHERE campaign_id = ? ORDER BY group_id, price",
+            (campaign_id,),
+        ).fetchall()]
+    # Preserve history, but compare only the latest price per explicit association.
+    latest: dict[tuple[str, str, str], dict] = {}
+    for row in rows:
+        key = (row["group_id"], row["sku"], row["retailer"])
+        if key not in latest or row["observed_at"] >= latest[key]["observed_at"]:
+            latest[key] = row
+    current_rows = list(latest.values())
+    groups: list[dict] = []
+    for group_id in sorted({row["group_id"] for row in rows}):
+        items = sorted([row for row in current_rows if row["group_id"] == group_id], key=lambda item: item["price"])
+        prices = [float(item["price"]) for item in items if item["price"] is not None]
+        comparable = len({item["retailer"] for item in items}) >= 2
+        groups.append({
+            "group_id": group_id,
+            "name": items[0]["name"] if items else group_id,
+            "items": items,
+            "history": [row for row in rows if row["group_id"] == group_id],
+            "min_price": min(prices) if prices else None,
+            "max_price": max(prices) if prices else None,
+            "comparable": comparable,
+            "gap": (max(prices) - min(prices)) if prices and comparable else None,
+            "gap_percent": round(((max(prices) / min(prices)) - 1) * 100, 1) if prices and min(prices) and comparable else None,
+        })
+    return {"groups": groups, "count": len(current_rows), "history_count": len(rows), "group_count": len(groups)}
+
+
+def inventory_payload(campaign_id: str) -> dict:
+    campaign_payload(campaign_id)
+    with db() as connection:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT * FROM inventory_metrics WHERE campaign_id = ? ORDER BY CASE risk WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 ELSE 5 END, coverage_days",
+            (campaign_id,),
+        ).fetchall()]
+    summary = {risk: sum(row["risk"] == risk for row in rows) for risk in ["critical", "high", "medium", "low", "insufficient"]}
+    return {"items": rows, "count": len(rows), "summary": summary}
+
+
+def intelligence_payload(campaign_id: str) -> dict:
+    campaign = campaign_payload(campaign_id)
+    comparables = comparable_payload(campaign_id)
+    inventory = inventory_payload(campaign_id)
+    processed = campaign["summary"]["compliant"] + campaign["summary"]["non_compliant"]
+    compliance = round(campaign["summary"]["compliant"] / processed * 100, 1) if processed else None
+    commercial_gaps = sorted(
+        [product for product in campaign["products"] if product["status"] == "non_compliant" and product["difference"] is not None],
+        key=lambda product: product["difference"], reverse=True,
+    )
+    actions = []
+    critical_stock = inventory["summary"].get("critical", 0)
+    if critical_stock:
+        actions.append({"priority": "critical", "title": f"Reponer {critical_stock} SKU con quiebre inminente", "detail": "La cobertura es menor o igual al lead time.", "view": "inventory"})
+    if campaign["summary"]["non_compliant"]:
+        actions.append({"priority": "high", "title": f"Corregir {campaign['summary']['non_compliant']} incumplimientos promocionales", "detail": "El precio observado supera el precio acordado.", "view": "audit"})
+    large_gaps = sum((group.get("gap_percent") or 0) >= 12 for group in comparables["groups"])
+    if large_gaps:
+        actions.append({"priority": "medium", "title": f"Revisar {large_gaps} brechas competitivas sobre 12%", "detail": "Existen equivalencias explícitas con dispersión relevante.", "view": "competition"})
+    if not actions:
+        actions.append({"priority": "low", "title": "Operación sin alertas críticas", "detail": "Mantener monitoreo y actualizar las fuentes.", "view": "audit"})
+    missing_inputs = []
+    if not processed:
+        missing_inputs.append("precios observados y objetivos promocionales")
+    if not inventory["count"] or inventory["summary"].get("insufficient", 0):
+        missing_inputs.append("stock, ventas y lead time")
+    if not comparables["count"]:
+        missing_inputs.append("asociaciones de productos comparables")
+    if missing_inputs:
+        if len(actions) == 1 and actions[0]["priority"] == "low":
+            actions.clear()
+        actions.append({"priority": "medium", "title": "Completar datos para ampliar el diagnóstico", "detail": "Faltan: " + "; ".join(missing_inputs) + ".", "view": "audit"})
+    return {
+        "campaign_id": campaign_id,
+        "is_demo": bool(campaign.get("is_demo")),
+        "monitored_skus": campaign["summary"]["total"],
+        "compliance_percent": compliance,
+        "critical_alerts": critical_stock + campaign["summary"]["non_compliant"],
+        "price_gap_total": round(sum(max(product["difference"] or 0, 0) for product in commercial_gaps), 0),
+        "stock_risk": inventory["summary"],
+        "top_gaps": commercial_gaps[:5],
+        "actions": actions[:5],
+        "comparable_groups": comparables["groups"][:6],
+    }
+
+
 def screenshot_font(size: int) -> ImageFont.ImageFont:
     candidates = [
         Path(os.getenv("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf",
@@ -537,15 +1014,11 @@ def render_indirect_evidence_card(
     search_url: str,
     captured_at: datetime,
     note: str,
-    source_label: str = "referencia publica",
+    source_label: str = "referencia pública de Google",
+    confidence: Literal["low", "medium"] = "low",
 ) -> None:
-    """Clean internal MVP evidence card.
-
-    Visual disclaimer is optional via RADAR_EVIDENCE_DISCLAIMER=public.
-    Metadata (evidence_source/confidence) always stays honest in the database.
-    """
+    """Render a clearly identified derived reference, never an official screenshot."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    show_public_seal = (os.getenv("RADAR_EVIDENCE_DISCLAIMER", "internal").strip().lower() == "public")
 
     width, height = 1440, 900
     image = Image.new("RGB", (width, height), "#F4F6F2")
@@ -559,14 +1032,13 @@ def render_indirect_evidence_card(
     # Soft SaaS header (not a retailer clone).
     draw.rectangle((0, 0, width, 96), fill="#13241B")
     draw.text((40, 30), "Radar Retail", fill="#C8F16D", font=brand_font)
-    draw.text((200, 28), "Evidencia de monitoreo", fill="#F4F7F2", font=title_font)
+    draw.text((200, 28), "Referencia de monitoreo", fill="#F4F7F2", font=title_font)
 
-    if show_public_seal:
-        draw.rectangle((0, 96, width, 148), fill="#3D2A12")
-        draw.text((40, 110), "Referencia publica · confianza baja · no sustituye captura oficial", fill="#F8E3B0", font=small_font)
-        content_top = 180
-    else:
-        content_top = 130
+    confidence_label = "media" if confidence == "medium" else "baja"
+    disclaimer = f"Fuente pública · confianza {confidence_label} · ficha generada, no es pantallazo oficial"
+    draw.rectangle((0, 96, width, 148), fill="#3D2A12")
+    draw.text((40, 110), disclaimer, fill="#F8E3B0", font=small_font)
+    content_top = 180
 
     # Card body
     draw.rounded_rectangle((36, content_top, width - 36, height - 36), radius=24, fill="#FFFFFF")
@@ -598,8 +1070,7 @@ def render_indirect_evidence_card(
         draw.text((72, y), line, fill="#718078", font=small_font)
         y += 36
 
-    # Subtle footer for MVP internal use (no alarmist banner).
-    footer = "Radar Retail · evidencia de campana"
+    footer = "Radar Retail · referencia derivada de fuente pública · no oficial"
     draw.text((72, height - 78), footer, fill="#9AA59C", font=small_font)
     image.save(path, format="PNG", optimize=True)
 
@@ -730,6 +1201,7 @@ def store_capture(
                 captured_at=captured_at,
                 note="La versión móvil entregó reseñas; el precio proviene del JSON-LD público de la ficha.",
                 source_label="datos estructurados públicos de Ripley",
+                confidence="medium",
             )
             outcome["evidence_source"] = "retailer_structured"
             outcome["evidence_confidence"] = "medium"
@@ -1020,7 +1492,7 @@ def report_csv(campaign: dict) -> bytes:
         [
             "Campaña", "Cliente", "Inicio", "Término", "SKU", "Descripción", "Retail", "URL", "PVP",
             "PVP Descuento", "Precio observado", "Diferencia", "Cumplimiento", "Fecha captura", "IP",
-            "Evidencia oficial", "Evidencia Google", "Fuente evidencia", "Confianza", "Error",
+            "Evidencia oficial", "Evidencia Google", "Fuente evidencia", "Confianza", "Error", "Evidencia indirecta",
         ]
     )
     labels = {
@@ -1030,6 +1502,12 @@ def report_csv(campaign: dict) -> bytes:
         "blocked": "Bloqueado", "needs_review": "Requiere revisión",
     }
     for product in campaign["products"]:
+        source = product.get("evidence_source") or "retailer"
+        screenshot = product.get("screenshot_url") or ""
+        is_demo = bool(campaign.get("is_demo")) or source == "demo"
+        official = screenshot if source == "retailer" and not is_demo else ""
+        google = "" if is_demo else ((product.get("fallback_screenshot_url") or screenshot) if source == "google_reference" else (product.get("fallback_screenshot_url") or ""))
+        indirect = screenshot if source not in {"retailer", "google_reference", "demo"} and not is_demo else ""
         writer.writerow(
             [
                 safe_csv(campaign["name"]), safe_csv(campaign["client"]), campaign["start_date"], campaign["end_date"],
@@ -1038,9 +1516,10 @@ def report_csv(campaign: dict) -> bytes:
                 product["detected_price"] if product["detected_price"] is not None else "",
                 product["difference"] if product["difference"] is not None else "",
                 labels.get(product["status"], product["status"]), product["captured_at"] or "", product["ip_used"] or "",
-                product["screenshot_url"] or "", product.get("fallback_screenshot_url") or "",
-                product.get("evidence_source") or "retailer", product.get("evidence_confidence") or "",
+                official, google,
+                source, product.get("evidence_confidence") or "",
                 safe_csv(product["error"] or ""),
+                indirect,
             ]
         )
     return ("\ufeff" + output.getvalue()).encode("utf-8")
@@ -1050,12 +1529,7 @@ def report_csv(campaign: dict) -> bytes:
 def health():
     return {
         "status": "ok",
-        "engine": "pricebot",
         "browser_available": importlib.util.find_spec("playwright") is not None,
-        "database": "ok",
-        "api_port_expected": 8001,
-        "capture_modes": "local",
-        "cloud_note": webhook_requirement_note(),
     }
 
 
@@ -1069,6 +1543,11 @@ def list_campaigns() -> dict[str, list[dict]]:
     with db() as connection:
         rows = connection.execute("SELECT id FROM campaigns ORDER BY created_at DESC").fetchall()
     return {"campaigns": [campaign_payload(row["id"]) for row in rows]}
+
+
+@app.post("/api/demo", status_code=201)
+def create_demo() -> dict:
+    return seed_demo_campaign()
 
 
 @app.post("/api/campaigns", status_code=201)
@@ -1095,6 +1574,180 @@ def create_campaign(request: CampaignCreate) -> dict:
 @app.get("/api/campaigns/{campaign_id}")
 def get_campaign(campaign_id: str) -> dict:
     return campaign_payload(campaign_id)
+
+
+@app.get("/api/campaigns/{campaign_id}/intelligence")
+def campaign_intelligence(campaign_id: str) -> dict:
+    return intelligence_payload(campaign_id)
+
+
+@app.get("/api/campaigns/{campaign_id}/comparables")
+def get_comparables(campaign_id: str) -> dict:
+    return comparable_payload(campaign_id)
+
+
+@app.post("/api/campaigns/{campaign_id}/comparables/import")
+async def import_comparables(
+    campaign_id: str, file: UploadFile = File(...), replace: bool = Form(default=True),
+) -> dict:
+    campaign_payload(campaign_id)
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="El archivo supera el máximo de 12 MB.")
+    try:
+        rows = await run_in_threadpool(parse_tabular_file, file.filename or "comparables.csv", content)
+    except (ValueError, UnicodeDecodeError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    parsed = []
+    for row_number, row in enumerate(rows, start=2):
+        group_id = pick(row, ["grupo_comparable", "group_id", "grupo", "comparable_id"])
+        sku = pick(row, ["sku", "codigo", "id"])
+        retailer_value = pick(row, ["retailer", "retail", "cadena", "tienda"])
+        retailer = normalize_retailer(retailer_value) if retailer_value else ""
+        price_value = pick(row, ["precio", "price", "precio_observado", "observed_price"])
+        numeric_price = price_value.replace("$", "").replace(" ", "")
+        if not re.fullmatch(r"\d+(?:[.,]\d+)*", numeric_price):
+            continue
+        price = parse_number(price_value)
+        if not group_id or not sku or not retailer or not math.isfinite(price) or price <= 0:
+            continue
+        observed_value = pick(row, ["fecha", "observed_at", "fecha_observacion"])
+        try:
+            observed_at = datetime.fromisoformat(observed_value.replace("Z", "+00:00")) if observed_value else datetime.now().astimezone()
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.astimezone()
+            observed_at = observed_at.astimezone().isoformat(timespec="seconds")
+        except ValueError:
+            continue
+        parsed.append({
+            "group_id": group_id,
+            "sku": sku,
+            "name": pick(row, ["nombre", "name", "producto", "descripcion"]) or group_id,
+            "retailer": retailer,
+            "price": price,
+            "observed_at": observed_at,
+            "row": row_number,
+        })
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail="No encontramos comparables válidos. Usa grupo_comparable, SKU, retailer y precio.",
+        )
+    timestamp = now_iso()
+    with db() as connection:
+        if replace:
+            connection.execute("DELETE FROM comparable_prices WHERE campaign_id = ?", (campaign_id,))
+        for item in parsed:
+            connection.execute(
+                """
+                INSERT INTO comparable_prices
+                    (id, campaign_id, group_id, sku, name, retailer, price, observed_at, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'import', ?)
+                """,
+                (
+                    uuid4().hex, campaign_id, item["group_id"], item["sku"], item["name"],
+                    item["retailer"], item["price"], item["observed_at"], timestamp,
+                ),
+            )
+    result = comparable_payload(campaign_id)
+    result["imported"] = len(parsed)
+    result["skipped"] = len(rows) - len(parsed)
+    result["filename"] = file.filename or "comparables.csv"
+    return result
+
+
+@app.get("/api/campaigns/{campaign_id}/inventory")
+def get_inventory(campaign_id: str) -> dict:
+    return inventory_payload(campaign_id)
+
+
+@app.post("/api/campaigns/{campaign_id}/inventory/import")
+async def import_inventory(
+    campaign_id: str, file: UploadFile = File(...), replace: bool = Form(default=True),
+) -> dict:
+    campaign_payload(campaign_id)
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="El archivo supera el máximo de 12 MB.")
+    try:
+        rows = await run_in_threadpool(parse_tabular_file, file.filename or "inventario.csv", content)
+    except (ValueError, UnicodeDecodeError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    parsed = [inventory_row(row) for row in rows]
+    parsed = [item for item in parsed if item["sku"]]
+    if not parsed:
+        raise HTTPException(status_code=400, detail="No encontramos filas con SKU. Usa SKU, stock, ventas_30d y lead_time.")
+    timestamp = now_iso()
+    with db() as connection:
+        if replace:
+            connection.execute("DELETE FROM inventory_metrics WHERE campaign_id = ?", (campaign_id,))
+        for item in parsed:
+            connection.execute(
+                """
+                INSERT INTO inventory_metrics
+                    (id, campaign_id, sku, name, retailer, stock, sales_30d, daily_sales,
+                     lead_time_days, safety_stock, coverage_days, risk, stockout_date,
+                     action, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, sku, retailer) DO UPDATE SET
+                    name = excluded.name, stock = excluded.stock, sales_30d = excluded.sales_30d,
+                    daily_sales = excluded.daily_sales, lead_time_days = excluded.lead_time_days,
+                    safety_stock = excluded.safety_stock, coverage_days = excluded.coverage_days,
+                    risk = excluded.risk, stockout_date = excluded.stockout_date,
+                    action = excluded.action, updated_at = excluded.updated_at
+                """,
+                (
+                    uuid4().hex, campaign_id, item["sku"], item["name"], item["retailer"],
+                    item["stock"], item["sales_30d"], item["daily_sales"], item["lead_time_days"],
+                    item["safety_stock"], item["coverage_days"], item["risk"], item["stockout_date"],
+                    item["action"], timestamp, timestamp,
+                ),
+            )
+    result = inventory_payload(campaign_id)
+    result["imported"] = len(parsed)
+    result["filename"] = file.filename or "inventario.csv"
+    return result
+
+
+@app.get("/api/campaigns/{campaign_id}/brief")
+def campaign_brief(campaign_id: str) -> dict:
+    campaign = campaign_payload(campaign_id)
+    intelligence = intelligence_payload(campaign_id)
+    inventory = inventory_payload(campaign_id)
+    comparables = comparable_payload(campaign_id)
+    findings = []
+    for action in intelligence["actions"]:
+        findings.append({
+            "severity": action["priority"],
+            "title": action["title"],
+            "detail": action["detail"],
+            "recommendation": (
+                "Asignar responsable y resolver dentro de 24 horas."
+                if action["priority"] in {"critical", "high"}
+                else "Incluir en la próxima revisión comercial."
+            ),
+        })
+    return {
+        "title": f"Radar Brief · {campaign['name']}",
+        "generated_at": now_iso(),
+        "is_demo": bool(campaign.get("is_demo")),
+        "period": {"start": campaign["start_date"], "end": campaign["end_date"]},
+        "executive_summary": (
+            f"Se monitorearon {campaign['summary']['total']} SKU. "
+            + (f"El cumplimiento promocional es {intelligence['compliance_percent']}%. " if intelligence['compliance_percent'] is not None else "El cumplimiento promocional está sin datos evaluables. ")
+            + f"Hay {inventory['summary'].get('critical', 0)} riesgos críticos de quiebre y "
+            f"{comparables['group_count']} grupos comparables explícitos."
+        ),
+        "metrics": {
+            "sku": campaign["summary"]["total"],
+            "compliance_percent": intelligence["compliance_percent"],
+            "non_compliant": campaign["summary"]["non_compliant"],
+            "critical_stock": inventory["summary"].get("critical", 0),
+            "comparable_groups": comparables["group_count"],
+        },
+        "findings": findings,
+        "methodology": "Reglas determinísticas sobre precios, grupos comparables explícitos e inventario importado. No se inventan datos faltantes.",
+    }
 
 
 @app.get("/api/campaigns/{campaign_id}/price-history")
@@ -1222,6 +1875,8 @@ async def import_products(
 @app.post("/api/campaigns/{campaign_id}/run", status_code=202)
 def run_campaign(campaign_id: str, request: CampaignRunRequest, background_tasks: BackgroundTasks) -> dict:
     campaign = campaign_payload(campaign_id)
+    if campaign.get("is_demo"):
+        return campaign
     if campaign["status"] == "running":
         raise HTTPException(status_code=409, detail="La campaña ya se está ejecutando.")
     if not campaign["products"]:
@@ -1315,8 +1970,11 @@ def download_evidence(campaign_id: str) -> StreamingResponse:
     with ZipFile(archive, "w", ZIP_DEFLATED) as bundle:
         bundle.writestr(f"reporte-{slug(campaign['name'])}.csv", report_csv(campaign))
         for index, product in enumerate(campaign["products"], start=1):
+            source = product.get("evidence_source") or "retailer"
+            if campaign.get("is_demo") or source == "demo":
+                continue
             official = product.get("screenshot_url")
-            if official and product.get("evidence_source") != "google_reference":
+            if official and source == "retailer":
                 path = SCREENSHOTS_DIR / Path(official).name
                 if path.exists() and path.is_file():
                     name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-oficial.png"
@@ -1324,10 +1982,11 @@ def download_evidence(campaign_id: str) -> StreamingResponse:
             elif official:
                 path = SCREENSHOTS_DIR / Path(official).name
                 if path.exists() and path.is_file():
-                    name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-referencia-google.png"
+                    kind = "datos-estructurados" if source == "retailer_structured" else "referencia-google" if source == "google_reference" else "referencia-indirecta"
+                    name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-{kind}.png"
                     bundle.write(path, f"evidencias-indirectas/{name}")
             fallback = product.get("fallback_screenshot_url")
-            if fallback:
+            if fallback and fallback != official:
                 path = SCREENSHOTS_DIR / Path(fallback).name
                 if path.exists() and path.is_file():
                     name = f"{index:04d}-{slug(product['retailer'])}-{slug(product['sku'] or 'sin-sku')}-referencia-google.png"
@@ -1408,6 +2067,7 @@ async def fetch_price_for_product(request: PriceRequest) -> dict:
                 captured_at=captured_at,
                 note="La versión móvil entregó reseñas; el precio proviene del JSON-LD público de la ficha.",
                 source_label="datos estructurados públicos de Ripley",
+                confidence="medium",
             )
             result["evidence_source"] = "retailer_structured"
             result["evidence_confidence"] = "medium"

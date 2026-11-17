@@ -1,0 +1,6 @@
+sku;nombre;retailer;stock;ventas_30d;lead_time;stock_seguridad
+DEMO-FALA-A;DEMO Audio portátil;falabella_cl;20;90;10;5
+DEMO-PARIS-A;DEMO Audio portátil;paris_cl;75;90;10;5
+DEMO-RIPLEY-A;DEMO Audio portátil;ripley_cl;55;90;14;5
+DEMO-LIDER-B;DEMO Audífonos;walmart_cl;0;60;14;5
+DEMO-ABC-B;DEMO Audífonos;abc_cl;40;;12;5

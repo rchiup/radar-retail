@@ -1,0 +1,7 @@
+grupo_comparable;sku;nombre;retailer;precio;fecha
+DEMO-MODELO-A;DEMO-FALA-A;DEMO Audio portátil;falabella_cl;49990;2026-11-02
+DEMO-MODELO-A;DEMO-FALA-A;DEMO Audio portátil;falabella_cl;45990;2026-11-16
+DEMO-MODELO-A;DEMO-PARIS-A;DEMO Audio portátil;paris_cl;42990;2026-11-16
+DEMO-MODELO-A;DEMO-RIPLEY-A;DEMO Audio portátil;ripley_cl;47990;2026-11-16
+DEMO-MODELO-B;DEMO-LIDER-B;DEMO Audífonos;walmart_cl;29990;2026-11-16
+DEMO-MODELO-B;DEMO-ABC-B;DEMO Audífonos;abc_cl;34990;2026-11-16
